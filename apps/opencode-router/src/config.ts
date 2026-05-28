@@ -10,7 +10,7 @@ const packageDir = path.resolve(moduleDir, "..");
 dotenv.config({ path: path.join(packageDir, ".env") });
 dotenv.config();
 
-export type ChannelName = "telegram" | "slack";
+export type ChannelName = "telegram" | "slack" | "mattermost";
 
 export type TelegramIdentity = {
   id: string;
@@ -29,6 +29,14 @@ export type SlackIdentity = {
   id: string;
   botToken: string;
   appToken: string;
+  enabled?: boolean;
+  directory?: string;
+};
+
+export type MattermostIdentity = {
+  id: string;
+  serverUrl: string;
+  accessToken: string;
   enabled?: boolean;
   directory?: string;
 };
@@ -54,6 +62,10 @@ export type OpenCodeRouterConfigFile = {
       botToken?: string;
       appToken?: string;
     };
+    mattermost?: {
+      enabled?: boolean;
+      instances?: MattermostIdentity[];
+    };
   };
 };
 
@@ -72,6 +84,7 @@ export type Config = {
   model?: ModelRef;
   telegramBots: TelegramIdentity[];
   slackApps: SlackIdentity[];
+  mattermostInstances: MattermostIdentity[];
   dataDir: string;
   dbPath: string;
   logFile: string;
@@ -225,6 +238,29 @@ function coerceSlackApps(file: OpenCodeRouterConfigFile): SlackIdentity[] {
   return [];
 }
 
+function coerceMattermostInstances(file: OpenCodeRouterConfigFile): MattermostIdentity[] {
+  const mattermost = file.channels?.mattermost;
+  const instances = Array.isArray((mattermost as any)?.instances) ? ((mattermost as any).instances as unknown[]) : [];
+  const normalized: MattermostIdentity[] = [];
+  for (const entry of instances) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const serverUrl = typeof record.serverUrl === "string" ? record.serverUrl.trim() : "";
+    const accessToken = typeof record.accessToken === "string" ? record.accessToken.trim() : "";
+    if (!serverUrl || !accessToken) continue;
+    const id = normalizeId(typeof record.id === "string" ? record.id : "default");
+    const directory = typeof record.directory === "string" ? record.directory.trim() : "";
+    normalized.push({
+      id,
+      serverUrl,
+      accessToken,
+      enabled: record.enabled === undefined ? true : record.enabled === true,
+      ...(directory ? { directory } : {}),
+    });
+  }
+  return normalized;
+}
+
 export function loadConfig(
   env: EnvLike = process.env,
   options: { requireOpencode?: boolean } = {},
@@ -250,6 +286,7 @@ export function loadConfig(
   // for single-identity setups.
   const telegramBots = coerceTelegramBots(configFile);
   const slackApps = coerceSlackApps(configFile);
+  const mattermostInstances = coerceMattermostInstances(configFile);
 
   const envTelegram = env.TELEGRAM_BOT_TOKEN?.trim() ?? "";
   if (envTelegram && !telegramBots.some((bot) => bot.token === envTelegram)) {
@@ -260,6 +297,11 @@ export function loadConfig(
   if (envSlackBot && envSlackApp && !slackApps.some((app) => app.botToken === envSlackBot && app.appToken === envSlackApp)) {
     slackApps.unshift({ id: "env", botToken: envSlackBot, appToken: envSlackApp, enabled: true });
   }
+  const envMmServer = env.MATTERMOST_SERVER_URL?.trim() ?? "";
+  const envMmToken = env.MATTERMOST_ACCESS_TOKEN?.trim() ?? "";
+  if (envMmServer && envMmToken && !mattermostInstances.some((inst) => inst.serverUrl === envMmServer && inst.accessToken === envMmToken)) {
+    mattermostInstances.unshift({ id: "env", serverUrl: envMmServer, accessToken: envMmToken, enabled: true });
+  }
   const healthPort =
     parseInteger(env.OPENCODE_ROUTER_HEALTH_PORT) ??
     // Convenience alias (common on PaaS / local experiments)
@@ -269,6 +311,7 @@ export function loadConfig(
 
   const telegramEnabledDefault = configFile.channels?.telegram?.enabled ?? true;
   const slackEnabledDefault = configFile.channels?.slack?.enabled ?? true;
+  const mattermostEnabledDefault = configFile.channels?.mattermost?.enabled ?? true;
 
   return {
     configPath,
@@ -282,6 +325,10 @@ export function loadConfig(
     slackApps: slackApps.map((app) => ({
       ...app,
       enabled: app.enabled !== false && parseBoolean(env.SLACK_ENABLED, slackEnabledDefault),
+    })),
+    mattermostInstances: mattermostInstances.map((inst) => ({
+      ...inst,
+      enabled: inst.enabled !== false && parseBoolean(env.MATTERMOST_ENABLED, mattermostEnabledDefault),
     })),
     dataDir,
     dbPath,

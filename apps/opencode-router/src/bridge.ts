@@ -17,6 +17,7 @@ import { MediaStore } from "./media-store.js";
 import { buildPermissionRules, createClient } from "./opencode.js";
 import { isWithinWorkspaceRootPath, normalizeScopedDirectoryPath } from "./path-scope.js";
 import { chunkText, formatInputSummary, truncateText } from "./text.js";
+import { createMattermostAdapter } from "./mattermost.js";
 import { createSlackAdapter } from "./slack.js";
 import { createTelegramAdapter, isTelegramPeerId } from "./telegram.js";
 
@@ -148,6 +149,7 @@ const TOOL_LABELS: Record<string, string> = {
 const CHANNEL_LABELS: Record<ChannelName, string> = {
   telegram: "Telegram",
   slack: "Slack",
+  mattermost: "Mattermost",
 };
 
 const TYPING_INTERVAL_MS = 6000;
@@ -346,6 +348,10 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       const bot = config.telegramBots.find((entry) => entry.id === id);
       return typeof (bot as any)?.directory === "string" ? String((bot as any).directory).trim() : "";
     }
+    if (channel === "mattermost") {
+      const inst = config.mattermostInstances.find((entry) => entry.id === id);
+      return typeof (inst as any)?.directory === "string" ? String((inst as any).directory).trim() : "";
+    }
     const app = config.slackApps.find((entry) => entry.id === id);
     return typeof (app as any)?.directory === "string" ? String((app as any).directory).trim() : "";
   };
@@ -373,6 +379,9 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     if (channel === "telegram") {
       return config.telegramBots.map((bot) => ({ id: bot.id, directory: (bot.directory ?? "").trim() }));
     }
+    if (channel === "mattermost") {
+      return config.mattermostInstances.map((inst) => ({ id: inst.id, directory: (inst.directory ?? "").trim() }));
+    }
     return config.slackApps.map((app) => ({ id: app.id, directory: (app.directory ?? "").trim() }));
   };
 
@@ -398,6 +407,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       opencodeDirectory: config.opencodeDirectory,
       telegramBots: config.telegramBots.map((bot) => ({ id: bot.id, enabled: bot.enabled !== false })),
       slackApps: config.slackApps.map((app) => ({ id: app.id, enabled: app.enabled !== false })),
+      mattermostInstances: config.mattermostInstances.map((inst) => ({ id: inst.id, enabled: inst.enabled !== false })),
       groupsEnabled: config.groupsEnabled,
       permissionMode: config.permissionMode,
       toolUpdatesEnabled: config.toolUpdatesEnabled,
@@ -430,6 +440,18 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       const key = adapterKey("slack", app.id);
       logger.debug({ identityId: app.id }, "slack adapter enabled");
       const base = createSlackAdapter(app, config, logger, handleInbound, undefined, mediaStore);
+      adapters.set(key, { ...base, key });
+    }
+
+    const enabledMattermost = config.mattermostInstances.filter((inst) => inst.enabled !== false);
+    if (enabledMattermost.length === 0) {
+      logger.info("mattermost adapters disabled");
+      reportStatus?.("Mattermost adapters disabled.");
+    }
+    for (const inst of enabledMattermost) {
+      const key = adapterKey("mattermost", inst.id);
+      logger.debug({ identityId: inst.id }, "mattermost adapter enabled");
+      const base = createMattermostAdapter(inst, config, logger, handleInbound, mediaStore);
       adapters.set(key, { ...base, key });
     }
   }
@@ -742,6 +764,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           // WhatsApp removed; keep field for backward compatibility.
           whatsapp: false,
           slack: Array.from(adapters.keys()).some((key) => key.startsWith("slack:")),
+          mattermost: Array.from(adapters.keys()).some((key) => key.startsWith("mattermost:")),
         },
         config: {
           groupsEnabled,
@@ -1219,12 +1242,178 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           return { id, deleted };
         },
 
+        listMattermostIdentities: async () => {
+          return {
+            items: config.mattermostInstances.map((inst) => ({
+              id: inst.id,
+              enabled: inst.enabled !== false,
+              running: adapters.has(adapterKey("mattermost", inst.id)),
+            })),
+          };
+        },
+        upsertMattermostIdentity: async (input: { id?: string; serverUrl: string; accessToken: string; enabled?: boolean; directory?: string }) => {
+          const serverUrl = input.serverUrl?.trim() ?? "";
+          const accessToken = input.accessToken?.trim() ?? "";
+          if (!serverUrl || !accessToken) throw new Error("serverUrl and accessToken are required");
+          const id = normalizeIdentityId(input.id);
+          if (id === "env") throw new Error("identity id 'env' is reserved");
+          const enabled = input.enabled !== false;
+          const directoryInput = typeof input.directory === "string" ? input.directory.trim() : "";
+
+          const { config: current } = readConfigFile(config.configPath);
+          const mattermost = current.channels?.mattermost;
+          const instances = Array.isArray((mattermost as any)?.instances) ? (((mattermost as any).instances as unknown[]) ?? []) : [];
+          const nextInstances: any[] = [];
+          let found = false;
+          for (const entry of instances) {
+            if (!entry || typeof entry !== "object") continue;
+            const record = entry as Record<string, unknown>;
+            const entryId = normalizeIdentityId(typeof record.id === "string" ? record.id : "default");
+            if (entryId !== id) {
+              nextInstances.push(entry);
+              continue;
+            }
+            found = true;
+            const existingDirectory = typeof record.directory === "string" ? record.directory.trim() : "";
+            const directory = directoryInput || existingDirectory;
+            nextInstances.push({ id, serverUrl, accessToken, enabled, ...(directory ? { directory } : {}) });
+          }
+          if (!found) {
+            nextInstances.push({ id, serverUrl, accessToken, enabled, ...(directoryInput ? { directory: directoryInput } : {}) });
+          }
+
+          const next: OpenCodeRouterConfigFile = {
+            ...current,
+            channels: {
+              ...current.channels,
+              mattermost: {
+                ...(current.channels?.mattermost ?? {}),
+                enabled: true,
+                instances: nextInstances,
+              },
+            },
+          };
+          next.version = next.version ?? 1;
+          writeConfigFile(config.configPath, next);
+          config.configFile = next;
+
+          const existingIdx = config.mattermostInstances.findIndex((inst) => inst.id === id);
+          if (existingIdx >= 0) {
+            const prev = config.mattermostInstances[existingIdx];
+            const nextDirectory = directoryInput || (prev as any)?.directory || undefined;
+            config.mattermostInstances[existingIdx] = {
+              id,
+              serverUrl,
+              accessToken,
+              enabled,
+              ...(nextDirectory ? { directory: String(nextDirectory).trim() } : {}),
+            };
+          } else {
+            config.mattermostInstances.push({ id, serverUrl, accessToken, enabled, ...(directoryInput ? { directory: directoryInput } : {}) });
+          }
+
+          const key = adapterKey("mattermost", id);
+          const existing = adapters.get(key);
+          if (!enabled) {
+            if (existing) {
+              try {
+                await existing.stop();
+              } catch (error) {
+                logger.warn({ error, channel: "mattermost", identityId: id }, "failed to stop mattermost adapter");
+              }
+              adapters.delete(key);
+            }
+            return { id, enabled: false, applied: true };
+          }
+
+          if (existing) {
+            try {
+              await existing.stop();
+            } catch (error) {
+              logger.warn({ error, channel: "mattermost", identityId: id }, "failed to stop existing mattermost adapter");
+            }
+            adapters.delete(key);
+          }
+          const base = createMattermostAdapter(
+            { id, serverUrl, accessToken, enabled, ...(directoryInput ? { directory: directoryInput } : {}) },
+            config,
+            logger,
+            handleInbound,
+            mediaStore,
+          );
+          const adapter = { ...base, key };
+          adapters.set(key, adapter);
+
+          const startResult = await startAdapterBounded(adapter, {
+            timeoutMs: 2_500,
+            onError: (error) => {
+              logger.error({ error, channel: "mattermost", identityId: id }, "mattermost adapter start failed");
+              adapters.delete(key);
+            },
+          });
+
+          if (startResult.status === "timeout") {
+            return { id, enabled: true, applied: false, starting: true };
+          }
+          if (startResult.status === "error") {
+            return { id, enabled: true, applied: false, error: String(startResult.error) };
+          }
+          return { id, enabled: true, applied: true };
+        },
+        deleteMattermostIdentity: async (rawId: string) => {
+          const id = normalizeIdentityId(rawId);
+          if (id === "env") throw new Error("env identity cannot be deleted");
+
+          const { config: current } = readConfigFile(config.configPath);
+          const mattermost = current.channels?.mattermost;
+          const instances = Array.isArray((mattermost as any)?.instances) ? (((mattermost as any).instances as unknown[]) ?? []) : [];
+          const nextInstances: any[] = [];
+          let deleted = false;
+          for (const entry of instances) {
+            if (!entry || typeof entry !== "object") continue;
+            const record = entry as Record<string, unknown>;
+            const entryId = normalizeIdentityId(typeof record.id === "string" ? record.id : "default");
+            if (entryId === id) {
+              deleted = true;
+              continue;
+            }
+            nextInstances.push(entry);
+          }
+          const next: OpenCodeRouterConfigFile = {
+            ...current,
+            channels: {
+              ...current.channels,
+              mattermost: {
+                ...(current.channels?.mattermost ?? {}),
+                instances: nextInstances,
+              },
+            },
+          };
+          next.version = next.version ?? 1;
+          writeConfigFile(config.configPath, next);
+          config.configFile = next;
+
+          config.mattermostInstances.splice(0, config.mattermostInstances.length, ...config.mattermostInstances.filter((inst) => inst.id !== id));
+
+          const key = adapterKey("mattermost", id);
+          const existing = adapters.get(key);
+          if (existing) {
+            try {
+              await existing.stop();
+            } catch (error) {
+              logger.warn({ error, channel: "mattermost", identityId: id }, "failed to stop mattermost adapter");
+            }
+            adapters.delete(key);
+          }
+          return { id, deleted };
+        },
+
         listBindings: async (filters?: { channel?: string; identityId?: string }) => {
           const channelRaw = filters?.channel?.trim().toLowerCase();
           const identityIdRaw = filters?.identityId?.trim();
           let channel: ChannelName | undefined;
           if (channelRaw) {
-            if (channelRaw === "telegram" || channelRaw === "slack") {
+            if (channelRaw === "telegram" || channelRaw === "slack" || channelRaw === "mattermost") {
               channel = channelRaw as ChannelName;
             } else {
               throw new Error("Invalid channel");
@@ -1244,7 +1433,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         },
         setBinding: async (input: { channel: string; identityId?: string; peerId: string; directory: string }) => {
           const channel = input.channel.trim().toLowerCase();
-          if (channel !== "telegram" && channel !== "slack") {
+          if (channel !== "telegram" && channel !== "slack" && channel !== "mattermost") {
             throw new Error("Invalid channel");
           }
           const identityId = normalizeIdentityId(input.identityId);
@@ -1269,7 +1458,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         },
         clearBinding: async (input: { channel: string; identityId?: string; peerId: string }) => {
           const channel = input.channel.trim().toLowerCase();
-          if (channel !== "telegram" && channel !== "slack") {
+          if (channel !== "telegram" && channel !== "slack" && channel !== "mattermost") {
             throw new Error("Invalid channel");
           }
           const identityId = normalizeIdentityId(input.identityId);
@@ -1291,7 +1480,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           autoBind?: boolean;
         }) => {
           const channelRaw = input.channel.trim().toLowerCase();
-          if (channelRaw !== "telegram" && channelRaw !== "slack") {
+          if (channelRaw !== "telegram" && channelRaw !== "slack" && channelRaw !== "mattermost") {
             throw new Error("Invalid channel");
           }
           const channel = channelRaw as ChannelName;

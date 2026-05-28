@@ -13,6 +13,7 @@ import {
   readConfigFile,
   writeConfigFile,
   type ChannelName,
+  type MattermostIdentity,
   type OpenCodeRouterConfigFile,
   type SlackIdentity,
   type TelegramIdentity,
@@ -20,6 +21,7 @@ import {
 import { BridgeStore } from "./db.js";
 import { createLogger } from "./logger.js";
 import { createClient } from "./opencode.js";
+import { parseMattermostPeerId } from "./mattermost.js";
 import { parseSlackPeerId } from "./slack.js";
 import { truncateText } from "./text.js";
 
@@ -60,7 +62,7 @@ function createAppLogger(config: ReturnType<typeof loadConfig>) {
 
 function createConsoleReporter(): BridgeReporter {
   const formatChannel = (channel: ChannelName, identityId: string) => {
-    const name = channel === "telegram" ? "Telegram" : "Slack";
+    const name = channel === "telegram" ? "Telegram" : channel === "mattermost" ? "Mattermost" : "Slack";
     return `${name}/${identityId}`;
   };
 
@@ -143,6 +145,36 @@ function upsertSlackApp(cfg: OpenCodeRouterConfigFile, identity: SlackIdentity):
   return next;
 }
 
+function upsertMattermostInstance(cfg: OpenCodeRouterConfigFile, identity: MattermostIdentity): OpenCodeRouterConfigFile {
+  const next = { ...cfg };
+  next.channels = next.channels ?? {};
+  const existing = next.channels.mattermost ?? {};
+  const instances = Array.isArray(existing.instances) ? existing.instances.slice() : [];
+  const id = normalizeIdentityId(identity.id);
+  const filtered = instances.filter((i) => normalizeIdentityId(i.id) !== id);
+  filtered.push({
+    id,
+    serverUrl: identity.serverUrl,
+    accessToken: identity.accessToken,
+    enabled: identity.enabled !== false,
+    ...(identity.directory ? { directory: identity.directory } : {}),
+  });
+  next.channels.mattermost = { ...existing, enabled: true, instances: filtered };
+  return next;
+}
+
+function deleteMattermostInstance(cfg: OpenCodeRouterConfigFile, idRaw: string): { next: OpenCodeRouterConfigFile; deleted: boolean } {
+  const id = normalizeIdentityId(idRaw);
+  const next = { ...cfg };
+  next.channels = next.channels ?? {};
+  const existing = next.channels.mattermost ?? {};
+  const instances = Array.isArray(existing.instances) ? existing.instances.slice() : [];
+  const filtered = instances.filter((i) => normalizeIdentityId(i.id) !== id);
+  const deleted = filtered.length !== instances.length;
+  next.channels.mattermost = { ...existing, instances: filtered };
+  return { next, deleted };
+}
+
 function deleteSlackApp(cfg: OpenCodeRouterConfigFile, idRaw: string): { next: OpenCodeRouterConfigFile; deleted: boolean } {
   const id = normalizeIdentityId(idRaw);
   const next = { ...cfg };
@@ -188,7 +220,7 @@ const program = new Command();
 program
   .name("opencode-router")
   .version(VERSION)
-  .description("opencode-router: Slack + Telegram bridge + directory routing")
+  .description("opencode-router: Slack + Telegram + Mattermost bridge + directory routing")
   .option("--json", "Output in JSON format", false);
 
 program
@@ -222,6 +254,7 @@ program
           identities: {
             telegram: config.telegramBots.map((b) => ({ id: b.id, enabled: b.enabled !== false })),
             slack: config.slackApps.map((a) => ({ id: a.id, enabled: a.enabled !== false })),
+            mattermost: config.mattermostInstances.map((i) => ({ id: i.id, enabled: i.enabled !== false })),
           },
         });
       } else {
@@ -252,12 +285,14 @@ program
     const config = loadConfig(process.env, { requireOpencode: false });
     const telegram = config.telegramBots.map((b) => ({ id: b.id, enabled: b.enabled !== false }));
     const slack = config.slackApps.map((a) => ({ id: a.id, enabled: a.enabled !== false }));
+    const mattermost = config.mattermostInstances.map((i) => ({ id: i.id, enabled: i.enabled !== false }));
     if (useJson) {
       outputJson({
         config: config.configPath,
         healthPort: config.healthPort ?? null,
         telegram,
         slack,
+        mattermost,
         opencode: { url: config.opencodeUrl, directory: config.opencodeDirectory },
       });
       return;
@@ -266,6 +301,7 @@ program
     console.log(`Health port: ${config.healthPort ?? "(not set)"}`);
     console.log(`Telegram bots: ${telegram.length}`);
     console.log(`Slack apps: ${slack.length}`);
+    console.log(`Mattermost instances: ${mattermost.length}`);
     console.log(`opencode URL: ${config.opencodeUrl}`);
   });
 
@@ -429,6 +465,52 @@ slack
     process.exit(deleted ? 0 : 1);
   });
 
+const mattermost = program.command("mattermost").description("Mattermost identities");
+
+mattermost
+  .command("list")
+  .description("List Mattermost identities")
+  .action(() => {
+    const useJson = program.opts().json;
+    const config = loadConfig(process.env, { requireOpencode: false });
+    const items = config.mattermostInstances.map((i) => ({ id: i.id, enabled: i.enabled !== false, serverUrl: i.serverUrl }));
+    if (useJson) outputJson({ items });
+    else for (const item of items) console.log(`${item.id} ${item.enabled ? "enabled" : "disabled"} ${item.serverUrl}`);
+  });
+
+mattermost
+  .command("add")
+  .argument("<serverUrl>", "Mattermost server URL (e.g. https://mm.example.com)")
+  .argument("<accessToken>", "Personal access token")
+  .option("--id <id>", "Identity id (default: default)")
+  .option("--disabled", "Add identity but disable it", false)
+  .description("Add or update a Mattermost identity")
+  .action((serverUrl: string, accessToken: string, opts: { id?: string; disabled?: boolean }) => {
+    const useJson = program.opts().json;
+    const config = loadConfig(process.env, { requireOpencode: false });
+    const id = normalizeIdentityId(opts.id);
+    const enabled = !opts.disabled;
+    updateConfig(config.configPath, (cfg) =>
+      upsertMattermostInstance(cfg, { id, serverUrl: serverUrl.trim(), accessToken: accessToken.trim(), enabled }),
+    );
+    if (useJson) outputJson({ success: true, id, enabled });
+    else console.log(`Saved Mattermost identity: ${id}`);
+  });
+
+mattermost
+  .command("remove")
+  .argument("<id>", "Identity id")
+  .description("Remove a Mattermost identity")
+  .action((idRaw: string) => {
+    const useJson = program.opts().json;
+    const config = loadConfig(process.env, { requireOpencode: false });
+    const { next, deleted } = deleteMattermostInstance(readConfigFile(config.configPath).config, idRaw);
+    writeConfigFile(config.configPath, next);
+    if (useJson) outputJson({ success: deleted, id: normalizeIdentityId(idRaw) });
+    else console.log(deleted ? `Removed Mattermost identity: ${normalizeIdentityId(idRaw)}` : "Identity not found.");
+    process.exit(deleted ? 0 : 1);
+  });
+
 // -----------------------------------------------------------------------------
 // Bindings
 // -----------------------------------------------------------------------------
@@ -437,7 +519,7 @@ const bindings = program.command("bindings").description("Manage identity-scoped
 
 bindings
   .command("list")
-  .option("--channel <channel>", "telegram|slack")
+  .option("--channel <channel>", "telegram|slack|mattermost")
   .option("--identity <id>", "Identity id")
   .description("List bindings")
   .action((opts: { channel?: string; identity?: string }) => {
@@ -447,7 +529,7 @@ bindings
     const channelRaw = opts.channel?.trim().toLowerCase();
     const identityId = opts.identity?.trim() ? normalizeIdentityId(opts.identity) : undefined;
     const channel: ChannelName | undefined =
-      channelRaw === "telegram" || channelRaw === "slack" ? (channelRaw as ChannelName) : channelRaw ? (outputError("Invalid channel"), undefined) : undefined;
+      channelRaw === "telegram" || channelRaw === "slack" || channelRaw === "mattermost" ? (channelRaw as ChannelName) : channelRaw ? (outputError("Invalid channel"), undefined) : undefined;
     const items = store
       .listBindings({ ...(channel ? { channel } : {}), ...(identityId ? { identityId } : {}) })
       .map((b) => ({
@@ -464,7 +546,7 @@ bindings
 
 bindings
   .command("set")
-  .requiredOption("--channel <channel>", "telegram|slack")
+  .requiredOption("--channel <channel>", "telegram|slack|mattermost")
   .requiredOption("--identity <id>", "Identity id")
   .requiredOption("--peer <peerId>", "Peer id")
   .requiredOption("--dir <directory>", "Directory")
@@ -474,7 +556,7 @@ bindings
     const config = loadConfig(process.env, { requireOpencode: false });
     const store = new BridgeStore(config.dbPath);
     const channelRaw = opts.channel.trim().toLowerCase();
-    if (channelRaw !== "telegram" && channelRaw !== "slack") outputError("Invalid channel");
+    if (channelRaw !== "telegram" && channelRaw !== "slack" && channelRaw !== "mattermost") outputError("Invalid channel");
     const identityId = normalizeIdentityId(opts.identity);
     const peerId = opts.peer.trim();
     const directory = opts.dir.trim();
@@ -488,7 +570,7 @@ bindings
 
 bindings
   .command("clear")
-  .requiredOption("--channel <channel>", "telegram|slack")
+  .requiredOption("--channel <channel>", "telegram|slack|mattermost")
   .requiredOption("--identity <id>", "Identity id")
   .requiredOption("--peer <peerId>", "Peer id")
   .description("Clear a binding")
@@ -497,7 +579,7 @@ bindings
     const config = loadConfig(process.env, { requireOpencode: false });
     const store = new BridgeStore(config.dbPath);
     const channelRaw = opts.channel.trim().toLowerCase();
-    if (channelRaw !== "telegram" && channelRaw !== "slack") outputError("Invalid channel");
+    if (channelRaw !== "telegram" && channelRaw !== "slack" && channelRaw !== "mattermost") outputError("Invalid channel");
     const identityId = normalizeIdentityId(opts.identity);
     const peerId = opts.peer.trim();
     const ok = store.deleteBinding(channelRaw as ChannelName, identityId, peerId);
@@ -535,8 +617,8 @@ program
   }) => {
     const useJson = program.opts().json;
     const channelRaw = opts.channel.trim().toLowerCase();
-    if (channelRaw !== "telegram" && channelRaw !== "slack") {
-      outputError("Invalid channel. Must be 'telegram' or 'slack'.");
+    if (channelRaw !== "telegram" && channelRaw !== "slack" && channelRaw !== "mattermost") {
+      outputError("Invalid channel. Must be 'telegram', 'slack', or 'mattermost'.");
     }
 
     const config = loadConfig(process.env, { requireOpencode: false });
@@ -579,6 +661,52 @@ program
             await tg.api.sendDocument(chatId, new InputFile(item.filePath), {
               ...(caption ? { caption } : {}),
             });
+          }
+        }
+      } else if (channelRaw === "mattermost") {
+        const inst = config.mattermostInstances.find((i) => i.id === identityId);
+        if (!inst) throw new Error(`Mattermost identity not found: ${identityId}`);
+        const peer = parseMattermostPeerId(to);
+        if (!peer.channelId) throw new Error("Invalid recipient for Mattermost.");
+        const baseUrl = inst.serverUrl.replace(/\/+$/, "");
+        const headers = { Authorization: `Bearer ${inst.accessToken}`, "Content-Type": "application/json" };
+        if (message.trim()) {
+          const resp = await fetch(`${baseUrl}/api/v4/posts`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              channel_id: peer.channelId,
+              message,
+              ...(peer.rootPostId ? { root_id: peer.rootPostId } : {}),
+            }),
+          });
+          if (!resp.ok) throw new Error(`Mattermost: ${resp.status} ${await resp.text()}`);
+        }
+        for (const item of media) {
+          const fileData = await readFileAsync(item.filePath);
+          const formData = new FormData();
+          formData.append("channel_id", peer.channelId);
+          formData.append("files", new Blob([new Uint8Array(fileData)]), path.basename(item.filePath));
+          const uploadResp = await fetch(`${baseUrl}/api/v4/files`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${inst.accessToken}` },
+            body: formData,
+          });
+          if (!uploadResp.ok) throw new Error(`Mattermost upload: ${uploadResp.status} ${await uploadResp.text()}`);
+          const uploadResult = (await uploadResp.json()) as { file_infos?: Array<{ id: string }> };
+          const fileIds = (uploadResult.file_infos ?? []).map((fi) => fi.id);
+          if (fileIds.length > 0) {
+            const postResp = await fetch(`${baseUrl}/api/v4/posts`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                channel_id: peer.channelId,
+                message: caption || "",
+                ...(peer.rootPostId ? { root_id: peer.rootPostId } : {}),
+                file_ids: fileIds,
+              }),
+            });
+            if (!postResp.ok) throw new Error(`Mattermost post: ${postResp.status} ${await postResp.text()}`);
           }
         }
       } else {

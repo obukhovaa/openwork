@@ -15,6 +15,7 @@ export type HealthSnapshot = {
     telegram: boolean;
     whatsapp: boolean;
     slack: boolean;
+    mattermost: boolean;
   };
   config: {
     groupsEnabled: boolean;
@@ -53,12 +54,22 @@ export type SlackIdentityItem = {
   running: boolean;
 };
 
+export type MattermostIdentityItem = {
+  id: string;
+  enabled: boolean;
+  running: boolean;
+};
+
 export type TelegramIdentitiesResult = {
   items: TelegramIdentityItem[];
 };
 
 export type SlackIdentitiesResult = {
   items: SlackIdentityItem[];
+};
+
+export type MattermostIdentitiesResult = {
+  items: MattermostIdentityItem[];
 };
 
 export type UpsertIdentityResult = {
@@ -92,6 +103,14 @@ export type SlackIdentityUpsertInput = {
   id?: string;
   botToken: string;
   appToken: string;
+  enabled?: boolean;
+  directory?: string;
+};
+
+export type MattermostIdentityUpsertInput = {
+  id?: string;
+  serverUrl: string;
+  accessToken: string;
   enabled?: boolean;
   directory?: string;
 };
@@ -145,6 +164,9 @@ export type HealthHandlers = {
   listSlackIdentities?: () => Promise<SlackIdentitiesResult>;
   upsertSlackIdentity?: (input: SlackIdentityUpsertInput) => Promise<UpsertIdentityResult>;
   deleteSlackIdentity?: (id: string) => Promise<DeleteIdentityResult>;
+  listMattermostIdentities?: () => Promise<MattermostIdentitiesResult>;
+  upsertMattermostIdentity?: (input: MattermostIdentityUpsertInput) => Promise<UpsertIdentityResult>;
+  deleteMattermostIdentity?: (id: string) => Promise<DeleteIdentityResult>;
   listBindings?: (filters?: { channel?: string; identityId?: string }) => Promise<BindingsListResult>;
   setBinding?: (input: { channel: string; identityId?: string; peerId: string; directory: string }) => Promise<void>;
   clearBinding?: (input: { channel: string; identityId?: string; peerId: string }) => Promise<void>;
@@ -453,6 +475,97 @@ export async function startHealthServer(
           const result = await handlers.deleteSlackIdentity(id);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, slack: result }));
+          return;
+        } catch (error) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(error) }));
+          return;
+        }
+      }
+
+      // GET /identities/mattermost
+      if (pathname === "/identities/mattermost" && req.method === "GET") {
+        if (!handlers.listMattermostIdentities) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Not supported" }));
+          return;
+        }
+        try {
+          const result = await handlers.listMattermostIdentities();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, ...result }));
+          return;
+        } catch (error) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(error) }));
+          return;
+        }
+      }
+
+      // POST /identities/mattermost
+      if (pathname === "/identities/mattermost" && req.method === "POST") {
+        if (!handlers.upsertMattermostIdentity) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Not supported" }));
+          return;
+        }
+        let raw = "";
+        for await (const chunk of req) {
+          raw += chunk.toString();
+          if (raw.length > 1024 * 1024) {
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Payload too large" }));
+            return;
+          }
+        }
+        try {
+          const payload = JSON.parse(raw || "{}");
+          const serverUrl = typeof payload.serverUrl === "string" ? payload.serverUrl.trim() : "";
+          const accessToken = typeof payload.accessToken === "string" ? payload.accessToken.trim() : "";
+          const id = typeof payload.id === "string" ? payload.id.trim() : undefined;
+          const directory = typeof payload.directory === "string" ? payload.directory.trim() : undefined;
+          const enabled = payload.enabled === undefined ? undefined : payload.enabled === true || payload.enabled === "true";
+          if (!serverUrl || !accessToken) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "serverUrl and accessToken are required" }));
+            return;
+          }
+          const result = await handlers.upsertMattermostIdentity({
+            id,
+            serverUrl,
+            accessToken,
+            ...(enabled === undefined ? {} : { enabled }),
+            ...(directory ? { directory } : {}),
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, mattermost: result }));
+          return;
+        } catch (error) {
+          const statusRaw = (error as any)?.status;
+          const status = typeof statusRaw === "number" && statusRaw >= 400 && statusRaw < 600 ? statusRaw : 500;
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(error instanceof Error ? error.message : error) }));
+          return;
+        }
+      }
+
+      // DELETE /identities/mattermost/:id
+      if (pathname.startsWith("/identities/mattermost/") && req.method === "DELETE") {
+        if (!handlers.deleteMattermostIdentity) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "Not supported" }));
+          return;
+        }
+        const id = pathname.slice("/identities/mattermost/".length).trim();
+        if (!id) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "id is required" }));
+          return;
+        }
+        try {
+          const result = await handlers.deleteMattermostIdentity(id);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, mattermost: result }));
           return;
         } catch (error) {
           res.writeHead(500, { "Content-Type": "application/json" });
