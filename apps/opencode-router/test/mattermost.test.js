@@ -980,3 +980,230 @@ test("createMattermostAdapter downloads inbound files into media store", async (
     globalThis.WebSocket = originalWebSocket;
   }
 });
+
+test("createMattermostAdapter ignores channel messages without @mention even with groupsEnabled", async () => {
+  const logger = createLoggerStub();
+  const inbound = [];
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  let wsInstance;
+
+  class MockWebSocket {
+    constructor() {
+      this.listeners = {};
+      wsInstance = this;
+      queueMicrotask(() => this._emit("open", {}));
+    }
+    addEventListener(event, handler) {
+      if (!this.listeners[event]) this.listeners[event] = [];
+      this.listeners[event].push(handler);
+    }
+    send(data) {
+      const parsed = JSON.parse(data);
+      if (parsed.action === "authentication_challenge") {
+        queueMicrotask(() => this._emit("message", { data: JSON.stringify({ event: "hello" }) }));
+      }
+    }
+    close() { this._emit("close", { code: 1000, reason: "" }); }
+    _emit(event, data) { for (const h of this.listeners[event] || []) h(data); }
+  }
+
+  globalThis.WebSocket = MockWebSocket;
+  globalThis.fetch = async (url) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.endsWith("/api/v4/users/me")) {
+      return new Response(JSON.stringify({ id: "bot123", username: "testbot" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+
+  try {
+    const adapter = createMattermostAdapter(
+      { id: "default", serverUrl: "https://mm.example.com", accessToken: "tok-test" },
+      { groupsEnabled: true },
+      logger,
+      async (msg) => inbound.push(msg),
+    );
+
+    await adapter.start();
+
+    wsInstance._emit("message", {
+      data: JSON.stringify({
+        event: "posted",
+        data: {
+          channel_type: "O",
+          post: JSON.stringify({
+            id: "post8",
+            channel_id: "ch1",
+            user_id: "user1",
+            root_id: "",
+            message: "just chatting without mentioning any bot",
+            props: {},
+          }),
+        },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(inbound.length, 0, "channel messages without @mention should be ignored");
+
+    await adapter.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("createMattermostAdapter ignores unknown channel types", async () => {
+  const logger = createLoggerStub();
+  const inbound = [];
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  let wsInstance;
+
+  class MockWebSocket {
+    constructor() {
+      this.listeners = {};
+      wsInstance = this;
+      queueMicrotask(() => this._emit("open", {}));
+    }
+    addEventListener(event, handler) {
+      if (!this.listeners[event]) this.listeners[event] = [];
+      this.listeners[event].push(handler);
+    }
+    send(data) {
+      const parsed = JSON.parse(data);
+      if (parsed.action === "authentication_challenge") {
+        queueMicrotask(() => this._emit("message", { data: JSON.stringify({ event: "hello" }) }));
+      }
+    }
+    close() { this._emit("close", { code: 1000, reason: "" }); }
+    _emit(event, data) { for (const h of this.listeners[event] || []) h(data); }
+  }
+
+  globalThis.WebSocket = MockWebSocket;
+  globalThis.fetch = async (url) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.endsWith("/api/v4/users/me")) {
+      return new Response(JSON.stringify({ id: "bot123", username: "testbot" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+
+  try {
+    const adapter = createMattermostAdapter(
+      { id: "default", serverUrl: "https://mm.example.com", accessToken: "tok-test" },
+      { groupsEnabled: true },
+      logger,
+      async (msg) => inbound.push(msg),
+    );
+
+    await adapter.start();
+
+    wsInstance._emit("message", {
+      data: JSON.stringify({
+        event: "posted",
+        data: {
+          channel_type: "X",
+          post: JSON.stringify({
+            id: "post9",
+            channel_id: "ch_unknown",
+            user_id: "user1",
+            root_id: "",
+            message: "mystery channel type",
+            props: {},
+          }),
+        },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(inbound.length, 0, "unknown channel types should be ignored");
+
+    await adapter.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("createMattermostAdapter sendText to invalid peerId throws", async () => {
+  const logger = createLoggerStub();
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  let wsInstance;
+
+  class MockWebSocket {
+    constructor() {
+      this.listeners = {};
+      wsInstance = this;
+      queueMicrotask(() => this._emit("open", {}));
+    }
+    addEventListener(event, handler) {
+      if (!this.listeners[event]) this.listeners[event] = [];
+      this.listeners[event].push(handler);
+    }
+    send(data) {
+      const parsed = JSON.parse(data);
+      if (parsed.action === "authentication_challenge") {
+        queueMicrotask(() => this._emit("message", { data: JSON.stringify({ event: "hello" }) }));
+      }
+    }
+    close() { this._emit("close", { code: 1000, reason: "" }); }
+    _emit(event, data) { for (const h of this.listeners[event] || []) h(data); }
+  }
+
+  globalThis.WebSocket = MockWebSocket;
+  globalThis.fetch = async (url) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.endsWith("/api/v4/users/me")) {
+      return new Response(JSON.stringify({ id: "bot123", username: "testbot" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+
+  try {
+    const adapter = createMattermostAdapter(
+      { id: "default", serverUrl: "https://mm.example.com", accessToken: "tok-test" },
+      { groupsEnabled: false },
+      logger,
+      async () => {},
+    );
+
+    await adapter.start();
+
+    await assert.rejects(
+      () => adapter.sendText("", "hello"),
+      /Invalid Mattermost peerId/,
+    );
+
+    await adapter.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("stripMattermostMention handles multiple mentions", () => {
+  assert.equal(
+    stripMattermostMention("@mybot do @mybot this", "mybot"),
+    "do   this",
+  );
+});
+
+test("stripMattermostMention handles empty text", () => {
+  assert.equal(stripMattermostMention("", "mybot"), "");
+  assert.equal(stripMattermostMention("  ", "mybot"), "");
+});

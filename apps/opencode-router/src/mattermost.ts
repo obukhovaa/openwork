@@ -439,11 +439,18 @@ export function createMattermostAdapter(
       // DMs and group DMs: always respond
     } else if (isChannel) {
       // Channels: require groupsEnabled + @mention
-      if (!config.groupsEnabled) return;
+      if (!config.groupsEnabled) {
+        log.debug({ channelType, channelId: post.channel_id }, "mattermost channel message ignored (groupsEnabled=false)");
+        return;
+      }
       if (!botUser?.username) return;
-      if (!post.message.includes(`@${botUser.username}`)) return;
+      if (!post.message.includes(`@${botUser.username}`)) {
+        log.debug({ channelType, channelId: post.channel_id }, "mattermost channel message ignored (no @mention)");
+        return;
+      }
     } else {
       // Unknown channel type: ignore
+      log.debug({ channelType }, "mattermost message ignored (unknown channel type)");
       return;
     }
 
