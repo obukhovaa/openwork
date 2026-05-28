@@ -1,6 +1,6 @@
 # opencode-router
 
-Simple Slack + Telegram bridge + directory router for a running `opencode` server.
+Simple Slack + Telegram + Mattermost bridge + directory router for a running `opencode` server.
 
 Runtime requirement: Bun 1.3+ (`bun --version`).
 
@@ -92,6 +92,25 @@ opencode-router slack add <xoxb> <xapp> --id default
 opencode-router slack list
 ```
 
+## Mattermost
+
+Mattermost support uses a personal access token + WebSocket for real-time events. No external dependencies are needed.
+
+1) In Mattermost, go to **Account Settings > Security > Personal Access Tokens** and create a token.
+2) Set env vars or use the CLI:
+   - `MATTERMOST_SERVER_URL=https://mm.example.com`
+   - `MATTERMOST_ACCESS_TOKEN=<token>`
+   - `MATTERMOST_ENABLED=true`
+
+To add identities via CLI:
+
+```bash
+opencode-router mattermost add https://mm.example.com <token> --id default
+opencode-router mattermost list
+```
+
+The bot responds to DMs and group DMs automatically. For public/private channel messages, enable groups (`GROUPS_ENABLED=true`) and @mention the bot.
+
 ## Identity-Scoped Routing
 
 The router routes messages based on `(channel, identityId, peerId) -> directory` bindings.
@@ -156,12 +175,16 @@ opencode-router telegram add <token> --id default
 opencode-router slack list
 opencode-router slack add <xoxb> <xapp> --id default
 
+opencode-router mattermost list
+opencode-router mattermost add <serverUrl> <accessToken> --id default
+
 opencode-router bindings list
 opencode-router bindings set --channel telegram --identity default --peer <chatId> --dir /path/to/workdir
 
 opencode-router send --channel telegram --identity default --to <chatId> --message "hello"
 opencode-router send --channel telegram --identity default --to <chatId> --image ./plot.png --caption "plot"
 opencode-router send --channel slack --identity default --to D123 --file ./report.pdf
+opencode-router send --channel mattermost --identity default --to <channelId> --message "hello"
 ```
 
 ## Defaults
