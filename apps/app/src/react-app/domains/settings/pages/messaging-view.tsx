@@ -15,7 +15,7 @@ import { TextInput } from "../../../design-system/text-input";
 const agentFilePath = ".opencode/agents/opencode-router.md";
 
 export type MessagingViewTab = "general" | "advanced";
-export type MessagingChannel = "telegram" | "slack";
+export type MessagingChannel = "telegram" | "slack" | "mattermost";
 export type MessagingViewExpandedChannel = MessagingChannel | null;
 
 export type MessagingViewProps = {
@@ -56,6 +56,16 @@ export type MessagingViewProps = {
     identitiesError: string | null;
     botToken: string;
     appToken: string;
+    enabled: boolean;
+    saving: boolean;
+    status: string | null;
+    error: string | null;
+  };
+  mattermost: {
+    identities: OpenworkOpenCodeRouterIdentityItem[];
+    identitiesError: string | null;
+    serverUrl: string;
+    accessToken: string;
     enabled: boolean;
     saving: boolean;
     status: string | null;
@@ -114,6 +124,11 @@ export type MessagingViewProps = {
   onSlackEnabledChange: (value: boolean) => void;
   onConnectSlack: () => void | Promise<void>;
   onDeleteSlack: (id: string) => void | Promise<void>;
+  onMattermostServerUrlChange: (value: string) => void;
+  onMattermostAccessTokenChange: (value: string) => void;
+  onMattermostEnabledChange: (value: boolean) => void;
+  onConnectMattermost: () => void | Promise<void>;
+  onDeleteMattermost: (id: string) => void | Promise<void>;
   onLoadAgentFile: () => void | Promise<void>;
   onCreateDefaultAgentFile: () => void | Promise<void>;
   onChangeAgentDraft: (value: string) => void;
@@ -147,6 +162,15 @@ function SlackIcon({ size = 20 }: { size?: number }) {
       <path d="M13.5 9.5h2v2h-2z" fill="#ECB22E" />
       <path d="M8.5 14.5h2v-2h-2z" fill="#2EB67D" />
       <path d="M13.5 14.5h2v-2h-2z" fill="#E01E5A" />
+    </svg>
+  );
+}
+
+function MattermostIcon({ size = 20 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" fill="#0058CC" />
+      <path d="M7 9h10M7 12h7M7 15h9" stroke="white" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
   );
 }
@@ -186,7 +210,8 @@ export function MessagingView(props: MessagingViewProps) {
   const agentDirty = props.agent.draft !== props.agent.content;
   const hasTelegramConnected = props.telegram.identities.some((item) => item.enabled);
   const hasSlackConnected = props.slack.identities.some((item) => item.enabled);
-  const connectedChannelCount = Number(hasTelegramConnected) + Number(hasSlackConnected);
+  const hasMattermostConnected = props.mattermost.identities.some((item) => item.enabled);
+  const connectedChannelCount = Number(hasTelegramConnected) + Number(hasSlackConnected) + Number(hasMattermostConnected);
   const messagesToday = props.health?.activity
     ? (props.health.activity.inboundToday ?? 0) + (props.health.activity.outboundToday ?? 0)
     : null;
@@ -809,6 +834,144 @@ export function MessagingView(props: MessagingViewProps) {
                           ) : null}
                           {props.slack.identities.length === 0 && props.slack.error ? (
                             <div className="text-[11px] text-red-12">{props.slack.error}</div>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div
+                    className={`overflow-hidden rounded-xl border transition-colors ${
+                      hasMattermostConnected ? "border-emerald-7/30 bg-emerald-1/20" : "border-gray-4 bg-gray-1"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      className="flex w-full items-center gap-3.5 px-4 py-3.5 text-left transition-colors hover:bg-gray-2/50"
+                      onClick={() => props.onToggleExpandedChannel("mattermost")}
+                    >
+                      <MattermostIcon size={28} />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[15px] font-semibold text-gray-12">Mattermost</span>
+                          {hasMattermostConnected ? (
+                            <span className="rounded-full bg-emerald-1/40 px-2 py-0.5 text-[10px] font-semibold text-emerald-11">
+                              {t("identities.connected_badge")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="mt-0.5 text-[13px] leading-snug text-gray-9">{t("identities.mattermost_desc")}</div>
+                      </div>
+                      <ChevronRight
+                        size={16}
+                        className={`shrink-0 text-gray-8 transition-transform ${
+                          props.expandedChannel === "mattermost" ? "rotate-90" : ""
+                        }`}
+                      />
+                    </button>
+
+                    {props.expandedChannel === "mattermost" ? (
+                      <div className="space-y-3 border-t border-gray-4 p-4 animate-[fadeUp_0.2s_ease-out]">
+                        {props.mattermost.identitiesError ? (
+                          <div className="rounded-lg border border-amber-7/20 bg-amber-1/30 px-3 py-2 text-xs text-amber-12">
+                            {props.mattermost.identitiesError}
+                          </div>
+                        ) : null}
+
+                        {props.mattermost.identities.length > 0 ? (
+                          <>
+                            <div className="space-y-2">
+                              {props.mattermost.identities.map((item) => (
+                                <div
+                                  key={item.id}
+                                  className="flex items-center justify-between gap-3 rounded-lg border border-gray-4 bg-gray-1 px-3 py-2.5"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-2">
+                                      <div
+                                        className={`size-1.5 shrink-0 rounded-full ${item.running ? "bg-emerald-9" : "bg-gray-8"}`}
+                                      />
+                                      <span className="truncate text-[13px] font-semibold text-gray-12">
+                                        <span className="font-mono text-[12px]">{item.id}</span>
+                                      </span>
+                                    </div>
+                                    <div className="mt-0.5 pl-3.5 text-[11px] text-gray-9">
+                                      {item.enabled ? t("identities.enabled_label") : t("identities.disabled_label")} · {item.running ? t("identities.running_label") : t("identities.stopped_label")}
+                                    </div>
+                                  </div>
+                                  <Button
+                                    variant="outline"
+                                    size="xs" className="shrink-0"
+                                    disabled={props.mattermost.saving || item.id === "env" || !scopedWorkspaceReady}
+                                    onClick={() => void props.onDeleteMattermost(item.id)}
+                                  >
+                                    {t("identities.disconnect")}
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+
+                            {props.mattermost.status ? <div className="text-[11px] text-gray-9">{props.mattermost.status}</div> : null}
+                            {props.mattermost.error ? <div className="text-[11px] text-red-12">{props.mattermost.error}</div> : null}
+                          </>
+                        ) : null}
+
+                        <div className="space-y-2.5">
+                          {props.mattermost.identities.length === 0 ? (
+                            <p className="text-[13px] leading-relaxed text-gray-10">{t("identities.mattermost_intro")}</p>
+                          ) : null}
+
+                          <div className="space-y-2">
+                            <TextInput
+                              label={t("identities.server_url_label")}
+                              placeholder="https://mm.example.com"
+                              value={props.mattermost.serverUrl}
+                              onChange={(event) => props.onMattermostServerUrlChange(event.currentTarget.value)}
+                              className="rounded-lg border-gray-4 bg-gray-1 px-3 py-2.5 text-sm text-gray-12 placeholder:text-gray-8"
+                            />
+                            <TextInput
+                              label={t("identities.access_token_label")}
+                              placeholder="Personal access token"
+                              type="password"
+                              value={props.mattermost.accessToken}
+                              onChange={(event) => props.onMattermostAccessTokenChange(event.currentTarget.value)}
+                              className="rounded-lg border-gray-4 bg-gray-1 px-3 py-2.5 text-sm text-gray-12 placeholder:text-gray-8"
+                            />
+                          </div>
+
+                          <label className="flex items-center gap-2 text-xs text-gray-11">
+                            <input
+                              type="checkbox"
+                              checked={props.mattermost.enabled}
+                              onChange={(event) => props.onMattermostEnabledChange(event.currentTarget.checked)}
+                            />
+                            {t("identities.enabled_label")}
+                          </label>
+
+                          <button
+                            type="button"
+                            onClick={() => void props.onConnectMattermost()}
+                            disabled={props.mattermost.saving || !scopedWorkspaceReady || !props.mattermost.serverUrl.trim() || !props.mattermost.accessToken.trim()}
+                            className={`flex items-center gap-2 rounded-lg border-none px-4 py-2.5 text-sm font-semibold text-white transition-opacity ${
+                              props.mattermost.saving || !scopedWorkspaceReady || !props.mattermost.serverUrl.trim() || !props.mattermost.accessToken.trim()
+                                ? "cursor-not-allowed opacity-50"
+                                : "cursor-pointer opacity-100 hover:opacity-90"
+                            }`}
+                            style={{ background: "#0058CC" }}
+                          >
+                            {props.mattermost.saving ? (
+                              <div className="size-3.5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                            ) : (
+                              <Link size={15} />
+                            )}
+                            {props.mattermost.saving ? t("identities.connecting") : t("identities.connect_mattermost")}
+                          </button>
+
+                          {props.mattermost.identities.length === 0 && props.mattermost.status ? (
+                            <div className="text-[11px] text-gray-9">{props.mattermost.status}</div>
+                          ) : null}
+                          {props.mattermost.identities.length === 0 && props.mattermost.error ? (
+                            <div className="text-[11px] text-red-12">{props.mattermost.error}</div>
                           ) : null}
                         </div>
                       </div>

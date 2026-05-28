@@ -104,6 +104,8 @@ export function useMessagingViewProps(
   const [telegramIdentitiesError, setTelegramIdentitiesError] = useState<string | null>(null);
   const [slackIdentities, setSlackIdentities] = useState<OpenworkOpenCodeRouterIdentityItem[]>([]);
   const [slackIdentitiesError, setSlackIdentitiesError] = useState<string | null>(null);
+  const [mattermostIdentities, setMattermostIdentities] = useState<OpenworkOpenCodeRouterIdentityItem[]>([]);
+  const [mattermostIdentitiesError, setMattermostIdentitiesError] = useState<string | null>(null);
 
   const [telegramToken, setTelegramToken] = useState("");
   const [telegramEnabled, setTelegramEnabled] = useState(true);
@@ -120,6 +122,13 @@ export function useMessagingViewProps(
   const [slackSaving, setSlackSaving] = useState(false);
   const [slackStatus, setSlackStatus] = useState<string | null>(null);
   const [slackError, setSlackError] = useState<string | null>(null);
+
+  const [mattermostServerUrl, setMattermostServerUrl] = useState("");
+  const [mattermostAccessToken, setMattermostAccessToken] = useState("");
+  const [mattermostEnabled, setMattermostEnabled] = useState(true);
+  const [mattermostSaving, setMattermostSaving] = useState(false);
+  const [mattermostStatus, setMattermostStatus] = useState<string | null>(null);
+  const [mattermostError, setMattermostError] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState<MessagingViewTab>("general");
   const [expandedChannel, setExpandedChannel] =
@@ -369,6 +378,7 @@ export function useMessagingViewProps(
       setHealthError(null);
       setTelegramIdentitiesError(null);
       setSlackIdentitiesError(null);
+      setMattermostIdentitiesError(null);
       setMessagingError(null);
 
       if (!id) {
@@ -377,9 +387,11 @@ export function useMessagingViewProps(
         setTelegramBotUsername(null);
         setTelegramPairingCode(null);
         setSlackIdentities([]);
+        setMattermostIdentities([]);
         setHealthError(t("identities.worker_scope_unavailable_detail"));
         setTelegramIdentitiesError(t("identities.worker_scope_unavailable"));
         setSlackIdentitiesError(t("identities.worker_scope_unavailable"));
+        setMattermostIdentitiesError(t("identities.worker_scope_unavailable"));
         resetAgentState();
         setSendStatus(null);
         setSendError(null);
@@ -401,16 +413,19 @@ export function useMessagingViewProps(
         setTelegramPairingCode(null);
         setSlackIdentities([]);
         setSlackIdentitiesError(null);
+        setMattermostIdentities([]);
+        setMattermostIdentitiesError(null);
         if (!agentDirty && !agentSaving) {
           void loadAgentFile();
         }
         return;
       }
 
-      const [healthRes, tgRes, slackRes, telegramInfo] = await Promise.all([
+      const [healthRes, tgRes, slackRes, mattermostRes, telegramInfo] = await Promise.all([
         (client as any).getOpenCodeRouterHealth(id),
         (client as any).getOpenCodeRouterTelegramIdentities(id),
         (client as any).getOpenCodeRouterSlackIdentities(id),
+        (client as any).getOpenCodeRouterMattermostIdentities(id).catch(() => ({ ok: false, items: [] })),
         (client as any).getOpenCodeRouterTelegram(id).catch(() => null),
       ]);
 
@@ -451,6 +466,13 @@ export function useMessagingViewProps(
         setSlackIdentitiesError(t("identities.slack_unavailable"));
       }
 
+      if (isOpenCodeRouterIdentities(mattermostRes)) {
+        setMattermostIdentities(mattermostRes.items ?? []);
+      } else {
+        setMattermostIdentities([]);
+        setMattermostIdentitiesError(t("identities.mattermost_unavailable"));
+      }
+
       if (!agentDirty && !agentSaving) {
         void loadAgentFile();
       }
@@ -460,9 +482,11 @@ export function useMessagingViewProps(
       setTelegramIdentities([]);
       setTelegramBotUsername(null);
       setSlackIdentities([]);
+      setMattermostIdentities([]);
       setHealthError(message);
       setTelegramIdentitiesError(message);
       setSlackIdentitiesError(message);
+      setMattermostIdentitiesError(message);
       if (messagingEnabled) {
         setMessagingRestartRequired(true);
       }
@@ -800,6 +824,92 @@ export function useMessagingViewProps(
     }
   }, [options.openworkServerClient, refreshAll, serverReady, slackSaving, workspaceId]);
 
+  const upsertMattermost = useCallback(async () => {
+    if (mattermostSaving) return;
+    if (!serverReady) return;
+    const id = workspaceId;
+    if (!id) return;
+    const client = options.openworkServerClient;
+    if (!client) return;
+
+    const serverUrl = mattermostServerUrl.trim();
+    const accessToken = mattermostAccessToken.trim();
+    if (!serverUrl || !accessToken) return;
+
+    setMattermostSaving(true);
+    setMattermostStatus(null);
+    setMattermostError(null);
+    try {
+      const result = await (client as any).upsertOpenCodeRouterMattermostIdentity(id, {
+        serverUrl,
+        accessToken,
+        enabled: mattermostEnabled,
+      });
+      if (result.ok) {
+        setMattermostStatus(
+          result.applied === false
+            ? t("identities.telegram_saved_pending")
+            : t("identities.telegram_saved"),
+        );
+      } else {
+        setMattermostError(t("identities.telegram_save_failed"));
+      }
+      if (typeof result.applyError === "string" && result.applyError.trim()) {
+        setMattermostError(result.applyError.trim());
+      }
+      setMattermostServerUrl("");
+      setMattermostAccessToken("");
+      void refreshAll({ force: true });
+    } catch (error) {
+      setMattermostError(formatRequestError(error));
+    } finally {
+      setMattermostSaving(false);
+    }
+  }, [
+    options.openworkServerClient,
+    refreshAll,
+    serverReady,
+    mattermostAccessToken,
+    mattermostServerUrl,
+    mattermostEnabled,
+    mattermostSaving,
+    workspaceId,
+  ]);
+
+  const deleteMattermost = useCallback(async (identityId: string) => {
+    if (mattermostSaving) return;
+    if (!serverReady) return;
+    const id = workspaceId;
+    if (!id) return;
+    const client = options.openworkServerClient;
+    if (!client) return;
+    if (!identityId.trim()) return;
+
+    setMattermostSaving(true);
+    setMattermostStatus(null);
+    setMattermostError(null);
+    try {
+      const result = await (client as any).deleteOpenCodeRouterMattermostIdentity(id, identityId);
+      if (result.ok) {
+        setMattermostStatus(
+          result.applied === false
+            ? t("identities.telegram_deleted_pending")
+            : t("identities.telegram_deleted"),
+        );
+      } else {
+        setMattermostError(t("identities.telegram_delete_failed"));
+      }
+      if (typeof result.applyError === "string" && result.applyError.trim()) {
+        setMattermostError(result.applyError.trim());
+      }
+      void refreshAll({ force: true });
+    } catch (error) {
+      setMattermostError(formatRequestError(error));
+    } finally {
+      setMattermostSaving(false);
+    }
+  }, [options.openworkServerClient, refreshAll, serverReady, mattermostSaving, workspaceId]);
+
   useEffect(() => {
     setHealth(null);
     setHealthError(null);
@@ -809,6 +919,8 @@ export function useMessagingViewProps(
     setTelegramPairingCode(null);
     setSlackIdentities([]);
     setSlackIdentitiesError(null);
+    setMattermostIdentities([]);
+    setMattermostIdentitiesError(null);
     resetAgentState();
     setSendStatus(null);
     setSendError(null);
@@ -880,6 +992,16 @@ export function useMessagingViewProps(
       status: slackStatus,
       error: slackError,
     },
+    mattermost: {
+      identities: mattermostIdentities,
+      identitiesError: mattermostIdentitiesError,
+      serverUrl: mattermostServerUrl,
+      accessToken: mattermostAccessToken,
+      enabled: mattermostEnabled,
+      saving: mattermostSaving,
+      status: mattermostStatus,
+      error: mattermostError,
+    },
     agent: {
       loading: agentLoading,
       saving: agentSaving,
@@ -948,6 +1070,11 @@ export function useMessagingViewProps(
     onSlackEnabledChange: setSlackEnabled,
     onConnectSlack: upsertSlack,
     onDeleteSlack: deleteSlack,
+    onMattermostServerUrlChange: setMattermostServerUrl,
+    onMattermostAccessTokenChange: setMattermostAccessToken,
+    onMattermostEnabledChange: setMattermostEnabled,
+    onConnectMattermost: upsertMattermost,
+    onDeleteMattermost: deleteMattermost,
     onLoadAgentFile: loadAgentFile,
     onCreateDefaultAgentFile: createDefaultAgentFile,
     onChangeAgentDraft: setAgentDraft,
