@@ -100,13 +100,6 @@ type MattermostFileCandidate = {
   kind: MediaKind;
 };
 
-function classifyMimeKind(mimeType: string | undefined): MediaKind {
-  if (!mimeType) return "file";
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("audio/")) return "audio";
-  return "file";
-}
-
 class MattermostClient {
   private readonly baseUrl: string;
   private readonly token: string;
