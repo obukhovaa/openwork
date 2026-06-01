@@ -1,7 +1,7 @@
 # Mattermost Channel Support for opencode-router
 
 **Date**: 2026-05-27
-**Status**: Draft
+**Status**: Implemented
 **Author**: AI-assisted
 
 ## Overview
@@ -266,15 +266,15 @@ apps/app/src/
 
 ### Phase 1: Core Adapter (`mattermost.ts`)
 
-- [ ] **1.1** Create `src/mattermost.ts` with `MattermostAdapter` type matching the shape in `bridge.ts:23-34`
-- [ ] **1.2** Implement thin REST client class wrapping `fetch`:
+- [x] **1.1** Create `src/mattermost.ts` with `MattermostAdapter` type matching the shape in `bridge.ts:23-34`
+- [x] **1.2** Implement thin REST client class wrapping `fetch`:
   - `getMe()` — `GET /api/v4/users/me` — to resolve bot user ID and username on start
   - `createPost(channelId, message, rootId?, fileIds?)` — `POST /api/v4/posts`
   - `uploadFiles(channelId, files: {data: Buffer, filename: string}[])` — `POST /api/v4/files` (multipart/form-data)
   - `userTyping(channelId)` — `POST /api/v4/users/{userId}/typing`
-- [ ] **1.3** Implement WebSocket connection with auth handshake
-- [ ] **1.4** Implement reconnection with exponential backoff + jitter (reuse `withDeliveryRetry` pattern or a dedicated reconnect loop)
-- [ ] **1.5** Implement inbound message handler:
+- [x] **1.3** Implement WebSocket connection with auth handshake
+- [x] **1.4** Implement reconnection with exponential backoff + jitter (reuse `withDeliveryRetry` pattern or a dedicated reconnect loop)
+- [x] **1.5** Implement inbound message handler:
   - Parse `posted` events (double-parse the `post` JSON string)
   - Filter own messages using bot user ID from `getMe()`
   - Filter webhook/integration posts: skip if `post.props.from_webhook === "true"` or `post.props.from_bot === "true"` to prevent feedback loops
@@ -282,26 +282,26 @@ apps/app/src/
   - For `"O"`/`"P"` channels: check `groupsEnabled`, check @mention presence, strip @mention from text
   - Download file attachments via `mediaStore` (files referenced by `file_ids` in post; download URL is `GET /api/v4/files/{file_id}`)
   - Build `InboundMessage` and call `onMessage`
-- [ ] **1.6** Implement outbound:
+- [x] **1.6** Implement outbound:
   - `sendMessage(peerId, {parts})` — iterate parts, send text via `createPost`, upload files via `uploadFiles` then attach to post
   - `sendText(peerId, text)` — convenience wrapper
   - `sendTyping(peerId)` — call `userTyping`
   - Use `chunkText` from `text.ts` with `MAX_TEXT_LENGTH = 16_383`
-- [ ] **1.7** Implement `start()` and `stop()` lifecycle:
+- [x] **1.7** Implement `start()` and `stop()` lifecycle:
   - `start()`: call `getMe()`, connect WebSocket, begin listening
   - `stop()`: close WebSocket, clear reconnection timers
-- [ ] **1.8** Export `createMattermostAdapter` factory function, `MattermostAdapter` type, and peer ID helpers (`formatMattermostPeerId`, `parseMattermostPeerId`)
+- [x] **1.8** Export `createMattermostAdapter` factory function, `MattermostAdapter` type, and peer ID helpers (`formatMattermostPeerId`, `parseMattermostPeerId`)
 
 ### Phase 2: Config & Bridge Wiring
 
-- [ ] **2.1** Update `config.ts`:
+- [x] **2.1** Update `config.ts`:
   - Add `"mattermost"` to `ChannelName` union
   - Add `MattermostIdentity` type: `{ id, serverUrl, accessToken, enabled?, directory? }`
   - Add `mattermost` section to `OpenCodeRouterConfigFile.channels`
   - Add `coerceMattermostInstances()` function (follow `coerceSlackApps` pattern)
   - Add `mattermostInstances` array to `Config` type
   - Wire env var fallback: `MATTERMOST_SERVER_URL`, `MATTERMOST_ACCESS_TOKEN`, `MATTERMOST_ENABLED`
-- [ ] **2.2** Update `bridge.ts`:
+- [x] **2.2** Update `bridge.ts`:
   - Import `createMattermostAdapter`
   - Add `"mattermost": "Mattermost"` to `CHANNEL_LABELS`
   - Add mattermost adapter creation loop alongside Telegram/Slack in `startBridge`
@@ -310,9 +310,9 @@ apps/app/src/
   - Update the `getStatus()` snapshot builder (~line 740) to add `mattermost: Array.from(adapters.keys()).some((key) => key.startsWith("mattermost:"))` to the `channels` object. Note: the existing `whatsapp: false` field is a backward-compatibility stub for a removed channel — leave it as-is, add `mattermost` alongside it
   - Wire health handlers: `listMattermostIdentities`, `upsertMattermostIdentity`, `deleteMattermostIdentity` (follow the exact pattern of `upsertSlackIdentity` at `bridge.ts:1064-1172`)
   - Update channel validation guards (search for `!== "telegram" && !== "slack"` patterns, e.g. lines 1227, 1247, 1272, 1294)
-- [ ] **2.3** Update `media.ts`:
+- [x] **2.3** Update `media.ts`:
   - Add `"mattermost"` to `InboundMediaAttachment.source` union type
-- [ ] **2.4** Update `health.ts`:
+- [x] **2.4** Update `health.ts`:
   - Add `mattermost: boolean` to `HealthSnapshot.channels` (note: the existing type already includes a `whatsapp: boolean` backward-compatibility stub hardcoded to `false` — leave it, add `mattermost` alongside it)
   - Add `MattermostIdentityItem` type (follow `SlackIdentityItem`)
   - Add `MattermostIdentitiesResult` type
@@ -323,7 +323,7 @@ apps/app/src/
 
 ### Phase 3: CLI
 
-- [ ] **3.1** Update `cli.ts`:
+- [x] **3.1** Update `cli.ts`:
   - Add `mattermost` command group with `list`, `add`, `remove` subcommands
   - `add` takes `<serverUrl> <accessToken>` positional args + `--id` option
   - `list` reads from config file and prints identity table
@@ -334,7 +334,7 @@ apps/app/src/
 
 ### Phase 4: Tests
 
-- [ ] **4.1** Create `test/mattermost.test.js`:
+- [x] **4.1** Create `test/mattermost.test.js`:
   - Test adapter creation with valid/invalid config
   - Test inbound message parsing (mock WebSocket events)
   - Test outbound message delivery (mock fetch)
@@ -347,23 +347,23 @@ apps/app/src/
 
 ### Phase 5: Desktop App UI
 
-- [ ] **5.1** Update `apps/app/src/app/lib/openwork-server.ts`:
+- [x] **5.1** Update `apps/app/src/app/lib/openwork-server.ts`:
   - Add API client methods: `getOpenCodeRouterMattermostIdentities(workspaceId)`, `upsertOpenCodeRouterMattermostIdentity(workspaceId, input)`, `deleteOpenCodeRouterMattermostIdentity(workspaceId, identityId)` — follow the existing Telegram/Slack method patterns
   - The response types (`OpenworkOpenCodeRouterHealthSnapshot`, `OpenworkOpenCodeRouterIdentityItem`) already use `Record<string, unknown>` so no type changes are needed
-- [ ] **5.2** Update `messaging-view.tsx`:
+- [x] **5.2** Update `messaging-view.tsx`:
   - Add `"mattermost"` to `MessagingChannel` type
   - Add Mattermost section in the channel list (Server URL + Access Token fields, enable/disable toggle)
-- [ ] **5.3** Update `messaging-view-state.ts`:
+- [x] **5.3** Update `messaging-view-state.ts`:
   - Add mattermost state variables (identities, serverUrl, accessToken, enabled, saving, status, error)
   - Add upsert/delete callbacks following the Slack pattern
   - Wire into `refreshAll` to fetch mattermost identities
-- [ ] **5.4** Add i18n strings to `en.ts` and propagate to other locales
+- [x] **5.4** Add i18n strings to `en.ts` and propagate to other locales
 
 ### Phase 6: Documentation & Polish
 
-- [ ] **6.1** Update `README.md` with Mattermost setup section
-- [ ] **6.2** Update `package.json` keywords to include `"mattermost"`
-- [ ] **6.3** Add `MATTERMOST_SERVER_URL`, `MATTERMOST_ACCESS_TOKEN`, `MATTERMOST_ENABLED` to `.env.example`
+- [x] **6.1** Update `README.md` with Mattermost setup section
+- [x] **6.2** Update `package.json` keywords to include `"mattermost"`
+- [x] **6.3** Add `MATTERMOST_SERVER_URL`, `MATTERMOST_ACCESS_TOKEN`, `MATTERMOST_ENABLED` to `.env.example`
 
 ## Edge Cases
 
@@ -454,21 +454,21 @@ apps/app/src/
 
 ## Success Criteria
 
-- [ ] `opencode-router mattermost add <url> <token> --id default` persists config and starts the adapter
-- [ ] `opencode-router mattermost list` shows configured identities
-- [ ] `opencode-router mattermost remove <id>` stops adapter and removes config
-- [ ] DM messages in Mattermost are received by the adapter and routed to an opencode session
-- [ ] @mentions in Mattermost channels (when `groupsEnabled=true`) trigger the adapter
-- [ ] Text replies from opencode are delivered back to the correct Mattermost channel/thread
-- [ ] File attachments (images, documents) in both directions work
-- [ ] `opencode-router send --channel mattermost --to <channelId> --message "test"` delivers
-- [ ] Health endpoint shows `"mattermost": true/false` in `channels`
-- [ ] `GET /identities/mattermost`, `POST /identities/mattermost`, `DELETE /identities/mattermost/:id` work
-- [ ] Desktop app Messaging settings page shows Mattermost section with connect/disconnect
-- [ ] WebSocket reconnects automatically after transient disconnection
-- [ ] Unit tests pass for adapter creation, message parsing, peer ID encoding, delivery
-- [ ] No new npm dependencies added
-- [ ] Existing Telegram and Slack functionality is unaffected (no regressions)
+- [x] `opencode-router mattermost add <url> <token> --id default` persists config and starts the adapter
+- [x] `opencode-router mattermost list` shows configured identities
+- [x] `opencode-router mattermost remove <id>` stops adapter and removes config
+- [x] DM messages in Mattermost are received by the adapter and routed to an opencode session
+- [x] @mentions in Mattermost channels (when `groupsEnabled=true`) trigger the adapter
+- [x] Text replies from opencode are delivered back to the correct Mattermost channel/thread
+- [x] File attachments (images, documents) in both directions work
+- [x] `opencode-router send --channel mattermost --to <channelId> --message "test"` delivers
+- [x] Health endpoint shows `"mattermost": true/false` in `channels`
+- [x] `GET /identities/mattermost`, `POST /identities/mattermost`, `DELETE /identities/mattermost/:id` work
+- [x] Desktop app Messaging settings page shows Mattermost section with connect/disconnect
+- [x] WebSocket reconnects automatically after transient disconnection
+- [x] Unit tests pass for adapter creation, message parsing, peer ID encoding, delivery
+- [x] No new npm dependencies added
+- [x] Existing Telegram and Slack functionality is unaffected (no regressions)
 
 ## References
 
