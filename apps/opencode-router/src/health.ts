@@ -19,6 +19,8 @@ export type HealthSnapshot = {
   };
   config: {
     groupsEnabled: boolean;
+    questionMode?: string;
+    pendingQuestions?: number;
   };
   activity?: {
     dayStart: number;

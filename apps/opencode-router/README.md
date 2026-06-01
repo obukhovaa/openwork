@@ -187,6 +187,30 @@ opencode-router send --channel slack --identity default --to D123 --file ./repor
 opencode-router send --channel mattermost --identity default --to <channelId> --message "hello"
 ```
 
+## Interactive Questions
+
+When the agent calls `AskUserQuestion`, the router relays the question to the user in their chat channel with numbered options. The user replies with a number (or free text) and the session resumes.
+
+Requires `OPENCODE_ENABLE_QUESTION_TOOL=1` on the `opencode serve` process.
+
+```
+Bot: [Question] Which database should I use?
+     1. PostgreSQL — Best for relational data
+     2. MySQL — Wide hosting support
+     3. SQLite — Zero-config, file-based
+     Reply with a number, or type your own answer.
+     Send /skip to skip this question.
+
+User: 1
+```
+
+Modes (set via `QUESTION_MODE` env var):
+- `interactive` (default) — relay questions to chat, wait for replies
+- `auto-reject` — immediately reject all questions (fully autonomous bots)
+- `disabled` — silently ignore questions (legacy behavior)
+
+Use `/skip` in chat to dismiss a pending question. Questions time out after 5 minutes (configurable via `QUESTION_TIMEOUT_MS`).
+
 ## Defaults
 
 - SQLite at `~/.openwork/opencode-router/opencode-router.db` unless overridden.

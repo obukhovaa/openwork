@@ -18,6 +18,7 @@ import { buildPermissionRules, createClient } from "./opencode.js";
 import { isWithinWorkspaceRootPath, normalizeScopedDirectoryPath } from "./path-scope.js";
 import { chunkText, formatInputSummary, truncateText } from "./text.js";
 import { createMattermostAdapter } from "./mattermost.js";
+import { formatQuestionMessage, parseQuestionAnswer, questionPeerKey, type PendingQuestion, type QuestionRequest } from "./question.js";
 import { createSlackAdapter } from "./slack.js";
 import { createTelegramAdapter, isTelegramPeerId } from "./telegram.js";
 
@@ -463,6 +464,10 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
   const sessionModels = new Map<string, ModelRef>();
   const typingLoops = new Map<string, NodeJS.Timeout>();
 
+  // Question relay state
+  const pendingQuestions = new Map<string, PendingQuestion>();
+  const seenQuestionIds = new Set<string>();
+
   const formatPeer = (_channel: ChannelName, peerId: string) => peerId;
 
   const normalizeDirectory = (input: string) =>
@@ -768,6 +773,8 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         },
         config: {
           groupsEnabled,
+          questionMode: config.questionMode,
+          pendingQuestions: pendingQuestions.size,
         },
         activity: {
           dayStart: activityDayStart,
@@ -1814,6 +1821,119 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
             }
           }
         }
+
+        if (event.type === "question.asked") {
+          const questionReq = event.properties as QuestionRequest | undefined;
+          if (!questionReq?.id || !questionReq.sessionID || !Array.isArray(questionReq.questions)) continue;
+
+          // Deduplicate across directory-scoped subscriptions
+          if (seenQuestionIds.has(questionReq.id)) continue;
+          seenQuestionIds.add(questionReq.id);
+
+          if (config.questionMode === "disabled") continue;
+
+          // Resolve peer from activeRuns by sessionID
+          let targetRun: RunState | undefined;
+          for (const run of activeRuns.values()) {
+            if (run.sessionID === questionReq.sessionID) {
+              targetRun = run;
+              break;
+            }
+          }
+          if (!targetRun) {
+            logger.warn({ requestID: questionReq.id, sessionID: questionReq.sessionID }, "question.asked: no active run found, auto-rejecting");
+            try {
+              await client.question.reject({ requestID: questionReq.id });
+            } catch (err) {
+              logger.debug({ error: err, requestID: questionReq.id }, "question.asked: reject after no-run failed");
+            }
+            seenQuestionIds.delete(questionReq.id);
+            continue;
+          }
+
+          if (config.questionMode === "auto-reject") {
+            try {
+              await client.question.reject({ requestID: questionReq.id });
+              await sendText(targetRun.channel, targetRun.identityId, targetRun.peerId, "The agent asked a question but interactive questions are disabled. The agent will handle this automatically.", { kind: "system" });
+            } catch (err) {
+              logger.debug({ error: err, requestID: questionReq.id }, "question.asked: auto-reject failed");
+            }
+            seenQuestionIds.delete(questionReq.id);
+            continue;
+          }
+
+          // Interactive mode: send the first question and store pending state
+          const pKey = questionPeerKey(targetRun.channel, targetRun.identityId, targetRun.peerKey);
+
+          // Replace any existing pending question for this peer
+          const existing = pendingQuestions.get(pKey);
+          if (existing && !existing.resolved) {
+            existing.resolved = true;
+            clearTimeout(existing.timeoutTimer);
+            try {
+              await client.question.reject({ requestID: existing.requestID });
+            } catch (err) {
+              logger.debug({ error: err, requestID: existing.requestID }, "question: replaced pending question, reject failed");
+            }
+            pendingQuestions.delete(pKey);
+          }
+
+          const firstMessage = formatQuestionMessage(questionReq.questions[0], 0, questionReq.questions.length);
+          await sendText(targetRun.channel, targetRun.identityId, targetRun.peerId, firstMessage, { kind: "system" });
+
+          const timeoutTimer = setTimeout(async () => {
+            const pending = pendingQuestions.get(pKey);
+            if (!pending || pending.resolved || pending.requestID !== questionReq.id) return;
+            pending.resolved = true;
+            pendingQuestions.delete(pKey);
+            seenQuestionIds.delete(questionReq.id);
+            try {
+              await client.question.reject({ requestID: questionReq.id });
+            } catch (err) {
+              logger.debug({ error: err, requestID: questionReq.id }, "question: timeout reject failed");
+            }
+            try {
+              await sendText(targetRun!.channel, targetRun!.identityId, targetRun!.peerId, "Question timed out.", { kind: "system" });
+            } catch {
+              // best effort
+            }
+            logger.info({ requestID: questionReq.id }, "question timed out");
+          }, config.questionTimeoutMs);
+
+          pendingQuestions.set(pKey, {
+            requestID: questionReq.id,
+            sessionID: questionReq.sessionID,
+            questions: questionReq.questions,
+            currentIndex: 0,
+            answers: [],
+            directory: resolved,
+            channel: targetRun.channel,
+            identityId: targetRun.identityId,
+            peerId: targetRun.peerId,
+            peerKey: targetRun.peerKey,
+            createdAt: Date.now(),
+            timeoutTimer,
+            resolved: false,
+          });
+
+          logger.info({ requestID: questionReq.id, peerKey: targetRun.peerKey, questionCount: questionReq.questions.length }, "question sent to peer");
+        }
+
+        if (event.type === "question.replied" || event.type === "question.rejected") {
+          const props = event.properties as { requestID?: string; sessionID?: string } | undefined;
+          if (props?.requestID) {
+            seenQuestionIds.delete(props.requestID);
+            // Defensive cleanup of pending state
+            for (const [key, pending] of pendingQuestions) {
+              if (pending.requestID === props.requestID) {
+                pending.resolved = true;
+                clearTimeout(pending.timeoutTimer);
+                pendingQuestions.delete(key);
+                break;
+              }
+            }
+          }
+        }
       }
     })().catch((error) => {
       if (abort.signal.aborted) return;
@@ -2002,6 +2122,87 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         trimmedText,
       );
       if (commandHandled) return;
+    }
+
+    // Question answer interception — MUST happen before enqueue to avoid deadlock.
+    // session.prompt() blocks inside the queue waiting for question answers,
+    // so we handle the answer directly and return early.
+    const qKey = questionPeerKey(inbound.channel, inbound.identityId, peerKey);
+    const pendingQ = pendingQuestions.get(qKey);
+    if (pendingQ && !pendingQ.resolved) {
+      // Only intercept text-only messages (media bypasses question handling)
+      const hasMedia = Array.isArray(inbound.parts) && inbound.parts.some((p) => p.type === "media");
+      if (!hasMedia && trimmedText) {
+        const question = pendingQ.questions[pendingQ.currentIndex];
+        const parsed = parseQuestionAnswer(trimmedText, question);
+
+        if (parsed.type === "ignore") {
+          // Empty input — re-prompt
+          await sendText(inbound.channel, inbound.identityId, inbound.peerId, formatQuestionMessage(question, pendingQ.currentIndex, pendingQ.questions.length), { kind: "system" });
+          return;
+        }
+
+        if (parsed.type === "reject") {
+          pendingQ.resolved = true;
+          clearTimeout(pendingQ.timeoutTimer);
+          pendingQuestions.delete(qKey);
+          seenQuestionIds.delete(pendingQ.requestID);
+          try {
+            await getClient(pendingQ.directory).question.reject({ requestID: pendingQ.requestID });
+          } catch (err) {
+            const status = (err as any)?.status;
+            if (status !== 404) {
+              logger.warn({ error: err, requestID: pendingQ.requestID }, "question reject failed");
+            }
+          }
+          await sendText(inbound.channel, inbound.identityId, inbound.peerId, "Question skipped.", { kind: "system" });
+          logger.info({ requestID: pendingQ.requestID }, "question rejected by user");
+          return;
+        }
+
+        if (parsed.type === "invalid") {
+          await sendText(inbound.channel, inbound.identityId, inbound.peerId, parsed.reason, { kind: "system" });
+          return;
+        }
+
+        // Valid answer
+        pendingQ.answers[pendingQ.currentIndex] = parsed.answer;
+        pendingQ.currentIndex += 1;
+
+        if (pendingQ.currentIndex < pendingQ.questions.length) {
+          // More questions remain — send next
+          const nextQ = pendingQ.questions[pendingQ.currentIndex];
+          await sendText(inbound.channel, inbound.identityId, inbound.peerId, formatQuestionMessage(nextQ, pendingQ.currentIndex, pendingQ.questions.length), { kind: "system" });
+          return;
+        }
+
+        // All questions answered — submit
+        pendingQ.resolved = true;
+        clearTimeout(pendingQ.timeoutTimer);
+        pendingQuestions.delete(qKey);
+        seenQuestionIds.delete(pendingQ.requestID);
+        try {
+          await getClient(pendingQ.directory).question.reply({ requestID: pendingQ.requestID, answers: pendingQ.answers });
+        } catch (err) {
+          const status = (err as any)?.status;
+          if (status === 404) {
+            logger.debug({ requestID: pendingQ.requestID }, "question reply got 404 (already resolved)");
+          } else if (status === 400) {
+            logger.error({ error: err, requestID: pendingQ.requestID }, "question reply bad request");
+            await sendText(inbound.channel, inbound.identityId, inbound.peerId, "Failed to submit answer.", { kind: "system" });
+          } else {
+            logger.error({ error: err, requestID: pendingQ.requestID }, "question reply failed");
+            await sendText(inbound.channel, inbound.identityId, inbound.peerId, "Failed to reach server. Try sending your answer again.", { kind: "system" });
+            // Restore pending state so user can retry
+            pendingQ.resolved = false;
+            pendingQ.currentIndex -= 1;
+            pendingQuestions.set(qKey, pendingQ);
+            seenQuestionIds.add(pendingQ.requestID);
+          }
+        }
+        logger.info({ requestID: pendingQ.requestID, answers: pendingQ.answers }, "question answered");
+        return;
+      }
     }
 
     reporter?.onInbound?.({
@@ -2253,10 +2454,20 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       return true;
     }
 
-    // /reset command - clear model override and session
+    // /reset command - clear model override, session, and pending questions
     if (command === "reset") {
       setUserModel(channel, identityId, peerKey, undefined);
       store.deleteSession(channel, identityId, peerKey);
+      // Clear any pending question for this peer
+      const qKey = questionPeerKey(channel, identityId, peerKey);
+      const pendingQ = pendingQuestions.get(qKey);
+      if (pendingQ && !pendingQ.resolved) {
+        pendingQ.resolved = true;
+        clearTimeout(pendingQ.timeoutTimer);
+        pendingQuestions.delete(qKey);
+        seenQuestionIds.delete(pendingQ.requestID);
+        getClient(pendingQ.directory).question.reject({ requestID: pendingQ.requestID }).catch(() => {});
+      }
       await sendText(channel, identityId, peerId, "Session and model reset. Send a message to start fresh.", {
         kind: "system",
       });
@@ -2327,7 +2538,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
 
     // /help command
     if (command === "help") {
-      const helpText = `/opus - Claude Opus 4.5\n/codex - GPT 5.2 Codex\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/agent - show workspace agent scope/path\n/model - show current\n/reset - start fresh\n/help - this`;
+      const helpText = `/opus - Claude Opus 4.5\n/codex - GPT 5.2 Codex\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/agent - show workspace agent scope/path\n/model - show current\n/skip - skip a pending question from the agent\n/reset - start fresh\n/help - this`;
       await sendText(channel, identityId, peerId, helpText, { kind: "system" });
       return true;
     }
@@ -2418,6 +2629,20 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         clearInterval(timer);
       }
       typingLoops.clear();
+      // Reject all pending questions on shutdown
+      for (const [key, pending] of pendingQuestions) {
+        if (!pending.resolved) {
+          pending.resolved = true;
+          clearTimeout(pending.timeoutTimer);
+          try {
+            await getClient(pending.directory).question.reject({ requestID: pending.requestID });
+          } catch {
+            // best effort on shutdown
+          }
+        }
+      }
+      pendingQuestions.clear();
+      seenQuestionIds.clear();
       for (const adapter of adapters.values()) {
         await adapter.stop();
       }

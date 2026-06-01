@@ -46,6 +46,7 @@ export type OpenCodeRouterConfigFile = {
   opencodeUrl?: string;
   opencodeDirectory?: string;
   groupsEnabled?: boolean;
+  questionMode?: "interactive" | "auto-reject" | "disabled";
   channels?: {
     telegram?: {
       enabled?: boolean;
@@ -91,6 +92,8 @@ export type Config = {
   toolUpdatesEnabled: boolean;
   groupsEnabled: boolean;
   permissionMode: "allow" | "deny";
+  questionMode: "interactive" | "auto-reject" | "disabled";
+  questionTimeoutMs: number;
   toolOutputLimit: number;
   healthPort?: number;
   logLevel: string;
@@ -281,6 +284,11 @@ export function loadConfig(
 
   const toolOutputLimit = parseInteger(env.TOOL_OUTPUT_LIMIT) ?? 1200;
   const permissionMode = env.PERMISSION_MODE?.toLowerCase() === "deny" ? "deny" : "allow";
+  const questionModeRaw = (env.QUESTION_MODE?.trim().toLowerCase() || configFile.questionMode || "interactive") as string;
+  const questionMode: Config["questionMode"] =
+    questionModeRaw === "auto-reject" ? "auto-reject" :
+    questionModeRaw === "disabled" ? "disabled" : "interactive";
+  const questionTimeoutMs = parseInteger(env.QUESTION_TIMEOUT_MS) ?? 5 * 60 * 1000;
 
   // Identities are loaded from config. Env vars are still supported as a convenience
   // for single-identity setups.
@@ -336,6 +344,8 @@ export function loadConfig(
     toolUpdatesEnabled: parseBoolean(env.TOOL_UPDATES_ENABLED, false),
     groupsEnabled: parseBoolean(env.GROUPS_ENABLED, configFile.groupsEnabled ?? false),
     permissionMode,
+    questionMode,
+    questionTimeoutMs,
     toolOutputLimit,
     healthPort,
     logLevel: env.LOG_LEVEL?.trim() || "info",
