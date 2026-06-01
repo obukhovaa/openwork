@@ -47,6 +47,7 @@ export type OpenCodeRouterConfigFile = {
   opencodeDirectory?: string;
   groupsEnabled?: boolean;
   toolUpdatesEnabled?: boolean;
+  permissionMode?: "allow" | "deny";
   questionMode?: "interactive" | "auto-reject" | "disabled";
   channels?: {
     telegram?: {
@@ -284,7 +285,8 @@ export function loadConfig(
   const resolvedDirectory = opencodeDirectory || process.cwd();
 
   const toolOutputLimit = parseInteger(env.TOOL_OUTPUT_LIMIT) ?? 1200;
-  const permissionMode = env.PERMISSION_MODE?.toLowerCase() === "deny" ? "deny" : "allow";
+  const permissionModeDefault = (configFile as any).permissionMode === "deny" ? "deny" : "allow";
+  const permissionMode = env.PERMISSION_MODE?.toLowerCase() === "deny" ? "deny" : env.PERMISSION_MODE ? "allow" : permissionModeDefault;
   const questionModeRaw = (env.QUESTION_MODE?.trim().toLowerCase() || configFile.questionMode || "interactive") as string;
   const questionMode: Config["questionMode"] =
     questionModeRaw === "auto-reject" ? "auto-reject" :
