@@ -51,6 +51,10 @@ vendor/opencode/
 .opencode/node_modules/
 .opencode/bun.lock
 
+# Lock files from non-pnpm package managers (project uses pnpm-lock.yaml)
+bun.lock
+package-lock.json
+
 # OpenWork workspace-local artifacts
 .opencode/openwork/
 .opencode/agents/openwork.md

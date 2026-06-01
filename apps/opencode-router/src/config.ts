@@ -46,6 +46,7 @@ export type OpenCodeRouterConfigFile = {
   opencodeUrl?: string;
   opencodeDirectory?: string;
   groupsEnabled?: boolean;
+  toolUpdatesEnabled?: boolean;
   questionMode?: "interactive" | "auto-reject" | "disabled";
   channels?: {
     telegram?: {
@@ -341,7 +342,7 @@ export function loadConfig(
     dataDir,
     dbPath,
     logFile,
-    toolUpdatesEnabled: parseBoolean(env.TOOL_UPDATES_ENABLED, false),
+    toolUpdatesEnabled: parseBoolean(env.TOOL_UPDATES_ENABLED, configFile.toolUpdatesEnabled ?? false),
     groupsEnabled: parseBoolean(env.GROUPS_ENABLED, configFile.groupsEnabled ?? false),
     permissionMode,
     questionMode,
