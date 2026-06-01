@@ -1824,13 +1824,14 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
 
         if (event.type === "question.asked") {
           const questionReq = event.properties as QuestionRequest | undefined;
-          if (!questionReq?.id || !questionReq.sessionID || !Array.isArray(questionReq.questions)) continue;
+          if (!questionReq?.id || !questionReq.sessionID || !Array.isArray(questionReq.questions) || questionReq.questions.length === 0) continue;
 
           // Deduplicate across directory-scoped subscriptions
           if (seenQuestionIds.has(questionReq.id)) continue;
-          seenQuestionIds.add(questionReq.id);
 
           if (config.questionMode === "disabled") continue;
+
+          seenQuestionIds.add(questionReq.id);
 
           // Resolve peer from activeRuns by sessionID
           let targetRun: RunState | undefined;
@@ -1870,6 +1871,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           if (existing && !existing.resolved) {
             existing.resolved = true;
             clearTimeout(existing.timeoutTimer);
+            seenQuestionIds.delete(existing.requestID);
             try {
               await client.question.reject({ requestID: existing.requestID });
             } catch (err) {
@@ -2196,6 +2198,17 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
             // Restore pending state so user can retry
             pendingQ.resolved = false;
             pendingQ.currentIndex -= 1;
+            // Restart timeout timer for the retry window
+            pendingQ.timeoutTimer = setTimeout(async () => {
+              const p = pendingQuestions.get(qKey);
+              if (!p || p.resolved || p.requestID !== pendingQ.requestID) return;
+              p.resolved = true;
+              pendingQuestions.delete(qKey);
+              seenQuestionIds.delete(pendingQ.requestID);
+              try { await getClient(p.directory).question.reject({ requestID: p.requestID }); } catch { /* best effort */ }
+              try { await sendText(p.channel, p.identityId, p.peerId, "Question timed out.", { kind: "system" }); } catch { /* best effort */ }
+              logger.info({ requestID: p.requestID }, "question timed out (after retry restore)");
+            }, config.questionTimeoutMs);
             pendingQuestions.set(qKey, pendingQ);
             seenQuestionIds.add(pendingQ.requestID);
           }
