@@ -159,10 +159,11 @@ const OPENCODE_ROUTER_AGENT_MAX_CHARS = 16_000;
 const DEFAULT_MESSAGING_AGENT_INSTRUCTIONS = [
   "Respond for non-technical users first.",
   "Do not tell users to run router commands; use tools on their behalf.",
-  "Never expose raw peer IDs or Telegram chat IDs unless the user explicitly asks for debug details.",
+  "Never expose raw peer IDs or chat IDs (Telegram, Slack, Mattermost) unless the user explicitly asks for debug details.",
   "Do not ask end users for peer IDs or identity IDs.",
-  "For Telegram send requests, try delivery immediately using existing bindings or direct tool calls.",
-  "If Telegram returns 'chat not found', explain that the recipient must message the bot first (for example with /start), then ask the user to retry.",
+  "To send a file back to the same conversation that sent the current message, include a line that begins with `FILE:` followed by the absolute path (e.g. `FILE:/path/to/image.png`). You can mix `FILE:` lines with surrounding prose — each `FILE:` line on its own line becomes a separate attachment, and the surrounding text is delivered as message text. The bridge routes everything through the originating channel. Do NOT call the router's /send HTTP API for replies — that endpoint is for proactive delivery to other peers.",
+  "Only use the /send HTTP API when explicitly asked to deliver something to a different channel or peer than the one you're currently handling.",
+  "If a channel delivery fails (e.g. Telegram 'chat not found'), explain the cause in plain language and ask the user to retry.",
   "Keep status updates concise and action-oriented.",
 ].join("\n");
 
@@ -202,6 +203,42 @@ function setUserModel(channel: ChannelName, identityId: string, peerId: string, 
 
 function adapterKey(channel: ChannelName, identityId: string): string {
   return `${channel}:${identityId}`;
+}
+
+// parseOutboundText splits an agent reply into mixed text and file parts.
+// Each line that starts with `FILE:` becomes a file part using the rest
+// of the line (trimmed) as an absolute path. Surrounding lines are
+// accumulated into text parts. Empty text parts are dropped.
+//
+// Example:
+//   "Here you go:\nFILE:/path/a.png\nAnd one more:\nFILE:/path/b.png"
+// → [text "Here you go:", file /path/a.png, text "And one more:", file /path/b.png]
+//
+// If no FILE: lines are present, returns a single text part as before.
+export function parseOutboundText(text: string): OutboundMessagePart[] {
+  if (!text.includes("FILE:")) {
+    return [{ type: "text", text }];
+  }
+  const parts: OutboundMessagePart[] = [];
+  let buffer: string[] = [];
+  const flushText = () => {
+    const joined = buffer.join("\n").trim();
+    if (joined) parts.push({ type: "text", text: joined });
+    buffer = [];
+  };
+  for (const line of text.split("\n")) {
+    if (line.startsWith("FILE:")) {
+      const filePath = line.slice(5).trim();
+      if (filePath) {
+        flushText();
+        parts.push({ type: "file", filePath });
+        continue;
+      }
+    }
+    buffer.push(line);
+  }
+  flushText();
+  return parts.length ? parts : [{ type: "text", text }];
 }
 
 function invalidTelegramPeerIdError(): Error & { status?: number } {
@@ -1956,10 +1993,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     text: string,
     options: { kind?: OutboundKind; display?: boolean } = {},
   ) {
-    const parts: OutboundMessagePart[] =
-      text.startsWith("FILE:") && text.substring(5).trim()
-        ? [{ type: "file", filePath: text.substring(5).trim() }]
-        : [{ type: "text", text }];
+    const parts: OutboundMessagePart[] = parseOutboundText(text);
     const delivery = await deliverParts(channel, identityId, peerId, parts, options);
     if (delivery.sentParts < delivery.attemptedParts) {
       const message = delivery.partResults.find((part) => !part.sent)?.error || "Failed to send message";
@@ -2309,8 +2343,10 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           .join("\n\n");
         const attachmentSummary = summarizeInboundPartsForPrompt(inbound.parts);
         const incomingText = inbound.text || "(no text; user sent media)";
+        const channelLabel = CHANNEL_LABELS[inbound.channel] ?? inbound.channel;
         const promptText = [
-          "You are handling a Slack/Telegram message via OpenWork.",
+          `You are handling a ${channelLabel} message via OpenWork.`,
+          `Current conversation channel: ${inbound.channel} (identity ${inbound.identityId}). Replies in this turn are routed back through it automatically — do not look up the peer ID or call /send for them.`,
           `Workspace agent file: ${messagingAgent.filePath}`,
           ...(messagingAgent.selectedAgent ? [`Selected OpenCode agent: ${messagingAgent.selectedAgent}`] : []),
           "Follow these workspace messaging instructions:",
