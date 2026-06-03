@@ -1782,25 +1782,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           if (!part?.sessionID) continue;
           const run = activeRuns.get(keyForSession(resolved, part.sessionID));
           if (!run || !run.toolUpdatesEnabled) continue;
-          if (part.type !== "tool") continue;
-
-          const callId = part.callID as string | undefined;
-          if (!callId) continue;
-          const state = part.state as { status?: string; input?: Record<string, unknown>; output?: string; title?: string };
-          const status = state?.status ?? "unknown";
-          if (run.seenToolStates.get(callId) === status) continue;
-          run.seenToolStates.set(callId, status);
-
-          const label = TOOL_LABELS[part.tool] ?? part.tool;
-          const title = state.title || truncateText(formatInputSummary(state.input ?? {}), 120) || "running";
-          let message = `[tool] ${label} ${status}: ${title}`;
-
-          if (status === "completed" && state.output) {
-            const output = truncateText(state.output.trim(), config.toolOutputLimit);
-            if (output) message += `\n${output}`;
-          }
-
-          await sendText(run.channel, run.identityId, run.peerId, message, { kind: "tool" });
+          await emitToolUpdate(run, part);
         }
 
         if (event.type === "permission.asked") {
@@ -1944,6 +1926,28 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
   };
 
   ensureEventSubscription(defaultDirectory);
+
+  async function emitToolUpdate(run: RunState, part: any): Promise<boolean> {
+    if (part?.type !== "tool") return false;
+    const callId = part.callID as string | undefined;
+    if (!callId) return false;
+    const state = part.state as { status?: string; input?: Record<string, unknown>; output?: string; title?: string } | undefined;
+    const status = state?.status ?? "unknown";
+    if (run.seenToolStates.get(callId) === status) return false;
+    run.seenToolStates.set(callId, status);
+
+    const label = TOOL_LABELS[part.tool as string] ?? (part.tool as string);
+    const title = state?.title || truncateText(formatInputSummary(state?.input ?? {}), 120) || "running";
+    let message = `[tool] ${label} ${status}: ${title}`;
+
+    if (status === "completed" && state?.output) {
+      const output = truncateText(state.output.trim(), config.toolOutputLimit);
+      if (output) message += `\n${output}`;
+    }
+
+    await sendText(run.channel, run.identityId, run.peerId, message, { kind: "tool" });
+    return true;
+  }
 
   async function sendText(
     channel: ChannelName,
@@ -2363,18 +2367,28 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         let parts = await runPrompt();
         logPromptResponse("initial", parts);
         let reply = extractReply(parts);
+        const hasToolParts = (list: PromptPart[]) => list.some((part) => part.type === "tool");
 
-        if (!reply && !parts.some((part) => part.type === "tool")) {
+        if (!reply && !hasToolParts(parts)) {
           logger.warn({ sessionID }, "prompt returned no visible text; retrying once");
           parts = await runPrompt();
           logPromptResponse("retry", parts);
           reply = extractReply(parts);
         }
 
+        // Fallback: emit [tool] messages for any tool parts the SSE stream missed
+        // (e.g. providers like openrouter that don't stream incremental tool events).
+        if (runState.toolUpdatesEnabled) {
+          for (const part of parts) {
+            if (part.type !== "tool") continue;
+            await emitToolUpdate(runState, part);
+          }
+        }
+
         if (reply) {
           logger.debug({ sessionID, replyLength: reply.length }, "reply built");
           await sendText(inbound.channel, inbound.identityId, inbound.peerId, reply, { kind: "reply" });
-        } else {
+        } else if (!hasToolParts(parts)) {
           logger.warn(
             { sessionID, partTypes: parts.map((part) => part.type), ignoredCount: parts.filter((part) => part.ignored).length },
             "prompt returned no visible text; clearing session",
@@ -2388,6 +2402,11 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
             {
               kind: "system",
             },
+          );
+        } else {
+          logger.debug(
+            { sessionID, partTypes: parts.map((part) => part.type) },
+            "prompt returned tool parts but no text reply",
           );
         }
       } catch (error) {
