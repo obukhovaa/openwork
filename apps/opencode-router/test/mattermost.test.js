@@ -561,6 +561,174 @@ test("createMattermostAdapter channel messages with groupsEnabled and @mention w
   }
 });
 
+test("createMattermostAdapter identity groupsEnabled override wins over global=false", async () => {
+  const logger = createLoggerStub();
+  const inbound = [];
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  let wsInstance;
+
+  class MockWebSocket {
+    constructor() {
+      this.listeners = {};
+      wsInstance = this;
+      queueMicrotask(() => this._emit("open", {}));
+    }
+    addEventListener(event, handler) {
+      if (!this.listeners[event]) this.listeners[event] = [];
+      this.listeners[event].push(handler);
+    }
+    send(data) {
+      const parsed = JSON.parse(data);
+      if (parsed.action === "authentication_challenge") {
+        queueMicrotask(() => this._emit("message", { data: JSON.stringify({ event: "hello" }) }));
+      }
+    }
+    close() { this._emit("close", { code: 1000, reason: "" }); }
+    _emit(event, data) { for (const h of this.listeners[event] || []) h(data); }
+  }
+
+  globalThis.WebSocket = MockWebSocket;
+  globalThis.fetch = async (url) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.endsWith("/api/v4/users/me")) {
+      return new Response(JSON.stringify({ id: "bot123", username: "testbot" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+
+  try {
+    // Global says no groups, but this identity overrides to true. Channel + @mention should reach inbound.
+    const adapter = createMattermostAdapter(
+      {
+        id: "default",
+        serverUrl: "https://mm.example.com",
+        accessToken: "tok-test",
+        groupsEnabled: true,
+      },
+      { groupsEnabled: false },
+      logger,
+      async (msg) => inbound.push(msg),
+    );
+
+    await adapter.start();
+
+    wsInstance._emit("message", {
+      data: JSON.stringify({
+        event: "posted",
+        data: {
+          channel_type: "O",
+          post: JSON.stringify({
+            id: "post-ovr1",
+            channel_id: "ch1",
+            user_id: "user1",
+            root_id: "",
+            message: "@testbot do the thing",
+            props: {},
+          }),
+        },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(inbound.length, 1, "identity override should re-enable channel posts even when global is false");
+    assert.equal(inbound[0].text, "do the thing");
+
+    await adapter.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
+test("createMattermostAdapter identity groupsEnabled override wins over global=true", async () => {
+  const logger = createLoggerStub();
+  const inbound = [];
+  const originalFetch = globalThis.fetch;
+  const originalWebSocket = globalThis.WebSocket;
+
+  let wsInstance;
+
+  class MockWebSocket {
+    constructor() {
+      this.listeners = {};
+      wsInstance = this;
+      queueMicrotask(() => this._emit("open", {}));
+    }
+    addEventListener(event, handler) {
+      if (!this.listeners[event]) this.listeners[event] = [];
+      this.listeners[event].push(handler);
+    }
+    send(data) {
+      const parsed = JSON.parse(data);
+      if (parsed.action === "authentication_challenge") {
+        queueMicrotask(() => this._emit("message", { data: JSON.stringify({ event: "hello" }) }));
+      }
+    }
+    close() { this._emit("close", { code: 1000, reason: "" }); }
+    _emit(event, data) { for (const h of this.listeners[event] || []) h(data); }
+  }
+
+  globalThis.WebSocket = MockWebSocket;
+  globalThis.fetch = async (url) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.endsWith("/api/v4/users/me")) {
+      return new Response(JSON.stringify({ id: "bot123", username: "testbot" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("Not Found", { status: 404 });
+  };
+
+  try {
+    // Global says yes, but this identity overrides to false. Channel post must be ignored.
+    // Exercises the `false ?? true === false` semantics — bug would be re-enabling against intent.
+    const adapter = createMattermostAdapter(
+      {
+        id: "default",
+        serverUrl: "https://mm.example.com",
+        accessToken: "tok-test",
+        groupsEnabled: false,
+      },
+      { groupsEnabled: true },
+      logger,
+      async (msg) => inbound.push(msg),
+    );
+
+    await adapter.start();
+
+    wsInstance._emit("message", {
+      data: JSON.stringify({
+        event: "posted",
+        data: {
+          channel_type: "O",
+          post: JSON.stringify({
+            id: "post-ovr2",
+            channel_id: "ch1",
+            user_id: "user1",
+            root_id: "",
+            message: "@testbot anything",
+            props: {},
+          }),
+        },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(inbound.length, 0, "identity override of false should suppress channel posts even when global is true");
+
+    await adapter.stop();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test("createMattermostAdapter group DMs always respond", async () => {
   const logger = createLoggerStub();
   const inbound = [];

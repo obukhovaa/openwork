@@ -438,8 +438,10 @@ export function createMattermostAdapter(
     if (isDmLike) {
       // DMs and group DMs: always respond
     } else if (isChannel) {
-      // Channels: require groupsEnabled + @mention
-      if (!config.groupsEnabled) {
+      // Channels: require groupsEnabled + @mention.
+      // Per-identity override wins over the global flag (undefined = follow global).
+      const groupsEnabled = identity.groupsEnabled ?? config.groupsEnabled;
+      if (!groupsEnabled) {
         log.debug({ channelType, channelId: post.channel_id }, "mattermost channel message ignored (groupsEnabled=false)");
         return;
       }

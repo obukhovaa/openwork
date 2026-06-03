@@ -263,8 +263,10 @@ export function createTelegramAdapter(
     const chatType = msg.chat.type as string;
     const isGroup = chatType === "group" || chatType === "supergroup" || chatType === "channel";
     
-    // In groups, check if groups are enabled
-    if (isGroup && !config.groupsEnabled) {
+    // In groups, check if groups are enabled.
+    // Per-identity override wins over the global flag (undefined = follow global).
+    const groupsEnabled = identity.groupsEnabled ?? config.groupsEnabled;
+    if (isGroup && !groupsEnabled) {
       log.debug({ chatId: msg.chat.id, chatType }, "telegram message ignored (groups disabled)");
       return;
     }

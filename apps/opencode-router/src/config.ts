@@ -23,6 +23,8 @@ export type TelegramIdentity = {
   access?: "public" | "private";
   // sha256 hash (hex) of normalized pairing code for private mode.
   pairingCodeHash?: string;
+  // Per-identity override of the global groupsEnabled flag. Omitted = follow global.
+  groupsEnabled?: boolean;
 };
 
 export type SlackIdentity = {
@@ -39,6 +41,8 @@ export type MattermostIdentity = {
   accessToken: string;
   enabled?: boolean;
   directory?: string;
+  // Per-identity override of the global groupsEnabled flag. Omitted = follow global.
+  groupsEnabled?: boolean;
 };
 
 export type OpenCodeRouterConfigFile = {
@@ -194,12 +198,14 @@ function coerceTelegramBots(file: OpenCodeRouterConfigFile): TelegramIdentity[] 
     const directory = typeof record.directory === "string" ? record.directory.trim() : "";
     const access = normalizeTelegramAccess(record.access);
     const pairingCodeHash = normalizePairingCodeHash(record.pairingCodeHash);
+    const groupsOverride = typeof record.groupsEnabled === "boolean" ? record.groupsEnabled : undefined;
     normalized.push({
       id,
       token,
       enabled: record.enabled === undefined ? true : record.enabled === true,
       ...(directory ? { directory } : {}),
       ...(access === "private" ? { access, ...(pairingCodeHash ? { pairingCodeHash } : {}) } : { access: "public" }),
+      ...(groupsOverride !== undefined ? { groupsEnabled: groupsOverride } : {}),
     });
   }
   if (normalized.length) return normalized;
@@ -255,12 +261,14 @@ function coerceMattermostInstances(file: OpenCodeRouterConfigFile): MattermostId
     if (!serverUrl || !accessToken) continue;
     const id = normalizeId(typeof record.id === "string" ? record.id : "default");
     const directory = typeof record.directory === "string" ? record.directory.trim() : "";
+    const groupsOverride = typeof record.groupsEnabled === "boolean" ? record.groupsEnabled : undefined;
     normalized.push({
       id,
       serverUrl,
       accessToken,
       enabled: record.enabled === undefined ? true : record.enabled === true,
       ...(directory ? { directory } : {}),
+      ...(groupsOverride !== undefined ? { groupsEnabled: groupsOverride } : {}),
     });
   }
   return normalized;
