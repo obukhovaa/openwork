@@ -1,7 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { Logger } from "pino";
@@ -154,9 +153,10 @@ const CHANNEL_LABELS: Record<ChannelName, string> = {
 };
 
 const TYPING_INTERVAL_MS = 6000;
-const OPENCODE_ROUTER_AGENT_FILE_RELATIVE_PATH = ".opencode/agents/opencode-router.md";
-const OPENCODE_ROUTER_AGENT_MAX_CHARS = 16_000;
-const DEFAULT_MESSAGING_AGENT_INSTRUCTIONS = [
+// Bridge-specific protocol instructions sent once per opencode session (on the
+// first user turn). Subsequent turns rely on opencode's session memory rather
+// than re-injecting the preamble — saves ~400 tokens per turn.
+const BRIDGE_PROTOCOL_INSTRUCTIONS = [
   "Respond for non-technical users first.",
   "Do not tell users to run router commands; use tools on their behalf.",
   "Never expose raw peer IDs or chat IDs (Telegram, Slack, Mattermost) unless the user explicitly asks for debug details.",
@@ -166,13 +166,6 @@ const DEFAULT_MESSAGING_AGENT_INSTRUCTIONS = [
   "If a channel delivery fails (e.g. Telegram 'chat not found'), explain the cause in plain language and ask the user to retry.",
   "Keep status updates concise and action-oriented.",
 ].join("\n");
-
-type MessagingAgentConfig = {
-  filePath: string;
-  loaded: boolean;
-  selectedAgent?: string;
-  instructions: string;
-};
 
 // Model presets for quick switching
 const MODEL_PRESETS: Record<string, ModelRef> = {
@@ -203,6 +196,24 @@ function setUserModel(channel: ChannelName, identityId: string, peerId: string, 
 
 function adapterKey(channel: ChannelName, identityId: string): string {
   return `${channel}:${identityId}`;
+}
+
+// formatRelativeAge produces a short relative timestamp (e.g. "3m ago",
+// "2h ago", "5d ago"). Used in the /sessions listing where the user wants
+// a quick sense of recency, not millisecond precision.
+export function formatRelativeAge(timestampMs: number, now: number = Date.now()): string {
+  if (!timestampMs || timestampMs <= 0) return "unknown";
+  const deltaSec = Math.max(0, Math.floor((now - timestampMs) / 1000));
+  if (deltaSec < 60) return `${deltaSec}s ago`;
+  const deltaMin = Math.floor(deltaSec / 60);
+  if (deltaMin < 60) return `${deltaMin}m ago`;
+  const deltaHr = Math.floor(deltaMin / 60);
+  if (deltaHr < 24) return `${deltaHr}h ago`;
+  const deltaDay = Math.floor(deltaHr / 24);
+  if (deltaDay < 30) return `${deltaDay}d ago`;
+  const deltaMonth = Math.floor(deltaDay / 30);
+  if (deltaMonth < 12) return `${deltaMonth}mo ago`;
+  return `${Math.floor(deltaMonth / 12)}y ago`;
 }
 
 // parseOutboundText splits an agent reply into mixed text and file parts.
@@ -292,82 +303,6 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
   const workspaceRoot = resolve(defaultDirectory || process.cwd());
   const mediaStore = new MediaStore(join(workspaceRoot, ".opencode-router", "media"));
   await mediaStore.ensureReady();
-  const workspaceAgentFilePath = join(workspaceRoot, OPENCODE_ROUTER_AGENT_FILE_RELATIVE_PATH);
-  const agentPromptCache = new Map<string, { mtimeMs: number; config: MessagingAgentConfig }>();
-  let latestAgentConfig: MessagingAgentConfig = {
-    filePath: workspaceAgentFilePath,
-    loaded: false,
-    instructions: "",
-  };
-
-  const parseMessagingAgentFile = (content: string): { selectedAgent?: string; instructions: string } => {
-    const lines = content.split(/\r?\n/);
-    let start = 0;
-    while (start < lines.length && !lines[start]?.trim()) {
-      start += 1;
-    }
-
-    let selectedAgent: string | undefined;
-    if (start < lines.length) {
-      const first = lines[start]?.trim() ?? "";
-      const match = first.match(/^@agent\s+([A-Za-z0-9_.:/-]+)$/);
-      if (match?.[1]) {
-        selectedAgent = match[1];
-        lines.splice(start, 1);
-      }
-    }
-
-    const instructions = lines.join("\n").trim();
-    return { ...(selectedAgent ? { selectedAgent } : {}), instructions };
-  };
-
-  const loadMessagingAgentConfig = async (): Promise<MessagingAgentConfig> => {
-    const filePath = workspaceAgentFilePath;
-    try {
-      const info = await stat(filePath);
-      if (!info.isFile()) {
-        agentPromptCache.delete(filePath);
-        latestAgentConfig = { filePath, loaded: false, instructions: "" };
-        return latestAgentConfig;
-      }
-
-      const cached = agentPromptCache.get(filePath);
-      if (cached && cached.mtimeMs === info.mtimeMs) {
-        latestAgentConfig = cached.config;
-        return latestAgentConfig;
-      }
-
-      const raw = (await readFile(filePath, "utf8")).trim();
-      if (!raw) {
-        const next: MessagingAgentConfig = { filePath, loaded: false, instructions: "" };
-        agentPromptCache.set(filePath, { mtimeMs: info.mtimeMs, config: next });
-        latestAgentConfig = next;
-        return next;
-      }
-
-      const truncated = raw.length > OPENCODE_ROUTER_AGENT_MAX_CHARS ? raw.slice(0, OPENCODE_ROUTER_AGENT_MAX_CHARS) : raw;
-      const parsed = parseMessagingAgentFile(truncated);
-      const next: MessagingAgentConfig = {
-        filePath,
-        loaded: Boolean(parsed.instructions || parsed.selectedAgent),
-        ...(parsed.selectedAgent ? { selectedAgent: parsed.selectedAgent } : {}),
-        instructions: parsed.instructions,
-      };
-      agentPromptCache.set(filePath, { mtimeMs: info.mtimeMs, config: next });
-      latestAgentConfig = next;
-      return next;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException)?.code;
-      if (code === "ENOENT") {
-        agentPromptCache.delete(filePath);
-        latestAgentConfig = { filePath, loaded: false, instructions: "" };
-        return latestAgentConfig;
-      }
-      logger.warn({ error, filePath }, "failed to load opencode-router agent file");
-      latestAgentConfig = { filePath, loaded: false, instructions: "" };
-      return latestAgentConfig;
-    }
-  };
 
   const isDangerousRootDirectory = (dir: string) => {
     const normalized = dir.trim();
@@ -655,8 +590,6 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     lastOutboundAt = now;
   };
 
-  await loadMessagingAgentConfig();
-
   const outboundMediaMaxBytesRaw = Number.parseInt(process.env.OPENCODE_ROUTER_MAX_MEDIA_BYTES ?? "", 10);
   const outboundMediaMaxBytes =
     Number.isFinite(outboundMediaMaxBytesRaw) && outboundMediaMaxBytesRaw > 0
@@ -822,12 +755,6 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
           ...(typeof lastInboundAt === "number" || typeof lastOutboundAt === "number"
             ? { lastMessageAt: Math.max(lastInboundAt ?? 0, lastOutboundAt ?? 0) }
             : {}),
-        },
-        agent: {
-          scope: "workspace",
-          path: latestAgentConfig.filePath,
-          loaded: latestAgentConfig.loaded,
-          ...(latestAgentConfig.selectedAgent ? { selected: latestAgentConfig.selectedAgent } : {}),
         },
       }),
       logger,
@@ -2297,23 +2224,25 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
 
     ensureEventSubscription(boundDirectory);
 
-    const sessionID =
-      session?.session_id && normalizeDirectory(session?.directory ?? "") === normalizeDirectory(boundDirectory)
-        ? session.session_id
-        : await createSession({
-            channel: inbound.channel,
-            identityId: inbound.identityId,
-            peerId: inbound.peerId,
-            peerKey,
-            directory: boundDirectory,
-          });
+    const reusingSession =
+      Boolean(session?.session_id) &&
+      normalizeDirectory(session?.directory ?? "") === normalizeDirectory(boundDirectory);
+    const sessionID = reusingSession
+      ? (session!.session_id as string)
+      : await createSession({
+          channel: inbound.channel,
+          identityId: inbound.identityId,
+          peerId: inbound.peerId,
+          peerKey,
+          directory: boundDirectory,
+        });
     const key = keyForSession(boundDirectory, sessionID);
     logger.debug(
       {
         sessionID,
         channel: inbound.channel,
         peerId: inbound.peerId,
-        reused: Boolean(session?.session_id),
+        reused: reusingSession,
       },
       "session resolved",
     );
@@ -2336,32 +2265,31 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       startTyping(runState);
       try {
         const effectiveModel = getUserModel(inbound.channel, inbound.identityId, peerKey, config.model);
-        const messagingAgent = await loadMessagingAgentConfig();
-        const effectiveInstructions = [messagingAgent.instructions, DEFAULT_MESSAGING_AGENT_INSTRUCTIONS]
-          .map((value) => value.trim())
-          .filter(Boolean)
-          .join("\n\n");
         const attachmentSummary = summarizeInboundPartsForPrompt(inbound.parts);
         const incomingText = inbound.text || "(no text; user sent media)";
         const channelLabel = CHANNEL_LABELS[inbound.channel] ?? inbound.channel;
-        const promptText = [
-          `You are handling a ${channelLabel} message via OpenWork.`,
-          `Current conversation channel: ${inbound.channel} (identity ${inbound.identityId}). Replies in this turn are routed back through it automatically — do not look up the peer ID or call /send for them.`,
-          `Workspace agent file: ${messagingAgent.filePath}`,
-          ...(messagingAgent.selectedAgent ? [`Selected OpenCode agent: ${messagingAgent.selectedAgent}`] : []),
-          "Follow these workspace messaging instructions:",
-          effectiveInstructions,
-          "",
-          "Incoming user message:",
-          incomingText,
-          ...(attachmentSummary.length ? ["", "Incoming attachments:", ...attachmentSummary] : []),
-        ].join("\n");
+        // First-turn preamble carries the bridge protocol (FILE: convention,
+        // channel context, no /send for replies). Subsequent turns rely on
+        // opencode's session memory — saves ~400 tokens per turn and keeps
+        // the conversation log clean.
+        const promptText = reusingSession
+          ? [incomingText, ...(attachmentSummary.length ? ["", "Incoming attachments:", ...attachmentSummary] : [])].join("\n")
+          : [
+              `You are handling a ${channelLabel} message via OpenWork.`,
+              `Current conversation channel: ${inbound.channel} (identity ${inbound.identityId}). Replies in this turn are routed back through it automatically — do not look up the peer ID or call /send for them.`,
+              "Follow these messaging instructions:",
+              BRIDGE_PROTOCOL_INSTRUCTIONS,
+              "",
+              "Incoming user message:",
+              incomingText,
+              ...(attachmentSummary.length ? ["", "Incoming attachments:", ...attachmentSummary] : []),
+            ].join("\n");
         logger.debug(
           {
             sessionID,
             length: inbound.text.length,
             model: effectiveModel,
-            agent: messagingAgent.selectedAgent,
+            preamble: !reusingSession,
           },
           "prompt start",
         );
@@ -2391,11 +2319,13 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
         };
 
         const runPrompt = async (): Promise<PromptPart[]> => {
+          // Don't pass `agent` here — opencode's --agent startup flag (or the
+          // session's bound agent) is the source of truth. Overriding per-prompt
+          // would conflict with the user's chosen agent.
           const response = await getClient(boundDirectory).session.prompt({
             sessionID,
             parts: [{ type: "text", text: promptText }],
             ...(effectiveModel ? { model: effectiveModel } : {}),
-            ...(messagingAgent.selectedAgent ? { agent: messagingAgent.selectedAgent } : {}),
           });
           return (response as { parts?: PromptPart[] }).parts ?? [];
         };
@@ -2492,6 +2422,29 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     });
   }
 
+  // Resolve the effective workspace directory for a (channel, identity, peer):
+  // explicit /dir binding wins, then the active session's recorded directory,
+  // then the bridge default. Mirrors the pattern used by `/dir` (no-arg form).
+  function resolveCommandDirectory(channel: ChannelName, identityId: string, peerKey: string): string {
+    const binding = store.getBinding(channel, identityId, peerKey);
+    const session = store.getSession(channel, identityId, peerKey);
+    return binding?.directory?.trim() || session?.directory?.trim() || defaultDirectory;
+  }
+
+  // Cancel any pending question for the given peer. Idempotent — safe to call
+  // when nothing is pending. Used by /reset and /session to avoid leaving a
+  // stale prompt waiting for an answer after the conversation state changes.
+  function cancelPendingQuestion(channel: ChannelName, identityId: string, peerKey: string) {
+    const qKey = questionPeerKey(channel, identityId, peerKey);
+    const pendingQ = pendingQuestions.get(qKey);
+    if (!pendingQ || pendingQ.resolved) return;
+    pendingQ.resolved = true;
+    clearTimeout(pendingQ.timeoutTimer);
+    pendingQuestions.delete(qKey);
+    seenQuestionIds.delete(pendingQ.requestID);
+    getClient(pendingQ.directory).question.reject({ requestID: pendingQ.requestID }).catch(() => {});
+  }
+
   async function handleCommand(
     channel: ChannelName,
     identityId: string,
@@ -2526,16 +2479,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     if (command === "reset") {
       setUserModel(channel, identityId, peerKey, undefined);
       store.deleteSession(channel, identityId, peerKey);
-      // Clear any pending question for this peer
-      const qKey = questionPeerKey(channel, identityId, peerKey);
-      const pendingQ = pendingQuestions.get(qKey);
-      if (pendingQ && !pendingQ.resolved) {
-        pendingQ.resolved = true;
-        clearTimeout(pendingQ.timeoutTimer);
-        pendingQuestions.delete(qKey);
-        seenQuestionIds.delete(pendingQ.requestID);
-        getClient(pendingQ.directory).question.reject({ requestID: pendingQ.requestID }).catch(() => {});
-      }
+      cancelPendingQuestion(channel, identityId, peerKey);
       await sendText(channel, identityId, peerId, "Session and model reset. Send a message to start fresh.", {
         kind: "system",
       });
@@ -2587,26 +2531,123 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       return true;
     }
 
-    if (command === "agent") {
-      const config = await loadMessagingAgentConfig();
-      await sendText(
-        channel,
-        identityId,
-        peerId,
-        [
-          `Scope: workspace`,
-          `Agent file: ${config.filePath}`,
-          `OpenCode agent: ${config.selectedAgent ?? "(none)"}`,
-          `Status: ${config.loaded ? "loaded" : "missing or empty"}`,
-        ].join("\n"),
-        { kind: "system" },
-      );
+    // /sessions — list recent opencode sessions in the current workspace.
+    // Router stays stateless about session history; opencode is the source of truth.
+    if (command === "sessions") {
+      const directory = resolveCommandDirectory(channel, identityId, peerKey);
+      const currentSessionId = store.getSession(channel, identityId, peerKey)?.session_id ?? null;
+      try {
+        // responseStyle: "data" is set on the client (opencode.ts), so the SDK
+        // returns the Session[] directly. The generated type still describes
+        // the "fields" shape, so we cast.
+        const response = await getClient(directory).session.list({ directory });
+        const all = (response ?? []) as unknown as Array<{
+          id: string;
+          title?: string;
+          directory: string;
+          time?: { updated?: number; created?: number };
+        }>;
+        // Belt-and-braces filter to this workspace. opencode's session.list with
+        // `directory` already scopes server-side; this guards against future
+        // SDK behavior changes and ensures we never expose a session from a
+        // different workspace.
+        const inWorkspace = all.filter((s) => s.directory === directory);
+        const sorted = inWorkspace
+          .slice()
+          .sort((a, b) => (b.time?.updated ?? b.time?.created ?? 0) - (a.time?.updated ?? a.time?.created ?? 0))
+          .slice(0, 10);
+
+        if (sorted.length === 0) {
+          await sendText(channel, identityId, peerId, `No sessions in ${directory}.`, { kind: "system" });
+          return true;
+        }
+
+        const lines = sorted.map((s) => {
+          const marker = s.id === currentSessionId ? "→" : " ";
+          const shortId = s.id.slice(0, 8);
+          const title = (s.title ?? "(untitled)").slice(0, 60);
+          const updated = s.time?.updated ?? s.time?.created ?? 0;
+          const age = formatRelativeAge(updated);
+          return `${marker} ${shortId}  ${title}  (${age})`;
+        });
+
+        const header = `Sessions in ${directory} (showing ${sorted.length} of ${inWorkspace.length}):`;
+        const footer = "Switch: /session <id-prefix>";
+        await sendText(channel, identityId, peerId, [header, ...lines, footer].join("\n"), { kind: "system" });
+      } catch (error) {
+        logger.warn({ error, directory }, "session list failed");
+        await sendText(channel, identityId, peerId, "Failed to list sessions. Check that OpenCode is reachable.", {
+          kind: "system",
+        });
+      }
+      return true;
+    }
+
+    // /session <id-or-prefix> — rebind this peer to an existing opencode session.
+    // Matching is by id prefix; ambiguous prefixes return a hint listing matches.
+    if (command === "session") {
+      const prefix = args.join(" ").trim();
+      if (!prefix) {
+        const current = store.getSession(channel, identityId, peerKey)?.session_id ?? null;
+        const msg = current
+          ? `Current session: ${current}\nUse /sessions to list, /session <id-prefix> to switch.`
+          : "No active session. Send a message to start one, or use /sessions to list and /session <id-prefix> to switch.";
+        await sendText(channel, identityId, peerId, msg, { kind: "system" });
+        return true;
+      }
+
+      const directory = resolveCommandDirectory(channel, identityId, peerKey);
+      try {
+        const response = await getClient(directory).session.list({ directory });
+        const all = (response ?? []) as unknown as Array<{
+          id: string;
+          title?: string;
+          directory: string;
+        }>;
+        const inWorkspace = all.filter((s) => s.directory === directory);
+        const matches = inWorkspace.filter((s) => s.id.startsWith(prefix));
+
+        if (matches.length === 0) {
+          await sendText(channel, identityId, peerId, `No session matches "${prefix}". Try /sessions.`, { kind: "system" });
+          return true;
+        }
+        if (matches.length > 1) {
+          const lines = matches
+            .slice(0, 5)
+            .map((s) => `  ${s.id.slice(0, 12)}  ${(s.title ?? "(untitled)").slice(0, 60)}`);
+          await sendText(
+            channel,
+            identityId,
+            peerId,
+            [`"${prefix}" matches ${matches.length} sessions — be more specific:`, ...lines].join("\n"),
+            { kind: "system" },
+          );
+          return true;
+        }
+
+        const target = matches[0]!;
+        store.upsertSession(channel, identityId, peerKey, target.id, directory);
+        cancelPendingQuestion(channel, identityId, peerKey);
+        logger.info({ channel, peerId: peerKey, sessionId: target.id }, "session switched via command");
+        await sendText(
+          channel,
+          identityId,
+          peerId,
+          `Switched to session ${target.id.slice(0, 12)} — ${target.title ?? "(untitled)"}`,
+          { kind: "system" },
+        );
+      } catch (error) {
+        logger.warn({ error, directory, prefix }, "session switch failed");
+        await sendText(channel, identityId, peerId, "Failed to switch sessions. Check that OpenCode is reachable.", {
+          kind: "system",
+        });
+      }
       return true;
     }
 
     // /help command
     if (command === "help") {
-      const helpText = `/opus - Claude Opus 4.5\n/codex - GPT 5.2 Codex\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/agent - show workspace agent scope/path\n/model - show current\n/skip - skip a pending question from the agent\n/reset - start fresh\n/help - this`;
+      const helpText = `/opus - Claude Opus 4.5\n/codex - GPT 5.2 Codex\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/model - show current\n/skip - skip a pending question from the agent\n/sessions - list recent sessions in this workspace\n/session <id-prefix> - switch to a previous session\n/reset - start fresh\n/help - this`;
       await sendText(channel, identityId, peerId, helpText, { kind: "system" });
       return true;
     }

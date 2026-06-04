@@ -30,12 +30,6 @@ export type HealthSnapshot = {
     lastOutboundAt?: number;
     lastMessageAt?: number;
   };
-  agent?: {
-    scope: "workspace";
-    path: string;
-    loaded: boolean;
-    selected?: string;
-  };
 };
 
 export type GroupsConfigResult = {
