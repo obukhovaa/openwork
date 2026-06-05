@@ -13,7 +13,7 @@ import { normalizeEvent } from "./events.js";
 import { startHealthServer, type HealthSnapshot } from "./health.js";
 import { type InboundMessagePart, type MessageDeliveryResult, type OutboundMessagePart, normalizeOutboundParts, summarizeInboundPartsForPrompt, summarizeInboundPartsForReporter, textFromInboundParts } from "./media.js";
 import { MediaStore } from "./media-store.js";
-import { buildPermissionRules, createClient } from "./opencode.js";
+import { buildPermissionRules, createClient, opencodeFetch } from "./opencode.js";
 import { isWithinWorkspaceRootPath, normalizeScopedDirectoryPath } from "./path-scope.js";
 import { chunkText, formatInputSummary, truncateText } from "./text.js";
 import { createMattermostAdapter } from "./mattermost.js";
@@ -167,35 +167,21 @@ const BRIDGE_PROTOCOL_INSTRUCTIONS = [
   "Keep status updates concise and action-oriented.",
 ].join("\n");
 
-// Model presets for quick switching
-const MODEL_PRESETS: Record<string, ModelRef> = {
-  opus: { providerID: "anthropic", modelID: "claude-opus-4-5-20251101" },
-  codex: { providerID: "openai", modelID: "gpt-5.2-codex" },
-};
-
-// Per-user model overrides (channel:peerId -> ModelRef)
-const userModelOverrides = new Map<string, ModelRef>();
-
-function getUserModelKey(channel: ChannelName, identityId: string, peerId: string): string {
-  return `${channel}:${identityId}:${peerId}`;
-}
-
-function getUserModel(channel: ChannelName, identityId: string, peerId: string, defaultModel?: ModelRef): ModelRef | undefined {
-  const key = getUserModelKey(channel, identityId, peerId);
-  return userModelOverrides.get(key) ?? defaultModel;
-}
-
-function setUserModel(channel: ChannelName, identityId: string, peerId: string, model: ModelRef | undefined): void {
-  const key = getUserModelKey(channel, identityId, peerId);
-  if (model) {
-    userModelOverrides.set(key, model);
-  } else {
-    userModelOverrides.delete(key);
-  }
-}
-
 function adapterKey(channel: ChannelName, identityId: string): string {
   return `${channel}:${identityId}`;
+}
+
+// formatTokens renders a token count compactly: 200000 → "200k",
+// 1500000 → "1.5M". Used in /model listings to keep lines short.
+export function formatTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) {
+    const k = n / 1000;
+    return k >= 100 ? `${Math.round(k)}k` : `${k.toFixed(k % 1 === 0 ? 0 : 1)}k`;
+  }
+  const m = n / 1_000_000;
+  return m >= 100 ? `${Math.round(m)}M` : `${m.toFixed(m % 1 === 0 ? 0 : 1)}M`;
 }
 
 // formatRelativeAge produces a short relative timestamp (e.g. "3m ago",
@@ -2264,7 +2250,9 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
       reportThinking(runState);
       startTyping(runState);
       try {
-        const effectiveModel = getUserModel(inbound.channel, inbound.identityId, peerKey, config.model);
+        // OPENCODE_ROUTER_MODEL forces a model per-prompt regardless of agent.
+        // Undefined → let opencode's active agent pick (the normal path).
+        const effectiveModel = config.model;
         const attachmentSummary = summarizeInboundPartsForPrompt(inbound.parts);
         const incomingText = inbound.text || "(no text; user sent media)";
         const channelLabel = CHANNEL_LABELS[inbound.channel] ?? inbound.channel;
@@ -2431,6 +2419,89 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     return binding?.directory?.trim() || session?.directory?.trim() || defaultDirectory;
   }
 
+  // Fetch primary agents from opencode (subagents excluded server-side
+  // via ?mode=agent). Returns a list shaped for /agent listing/switching.
+  async function fetchPrimaryAgents(_directory: string): Promise<Array<{ id: string; name: string; mode: string; model?: string; active: boolean }>> {
+    const raw = (await opencodeFetch(config, "GET", "/agent?mode=agent")) as Array<{
+      id: string;
+      name?: string;
+      mode?: string;
+      model?: string;
+      active?: boolean;
+    }>;
+    return raw.map((a) => ({
+      id: a.id,
+      name: a.name ?? a.id,
+      mode: a.mode ?? "agent",
+      ...(a.model ? { model: a.model } : {}),
+      active: Boolean(a.active),
+    }));
+  }
+
+  // Fetch providers + models, filtered to providers with credentials
+  // (the `connected` list from GET /provider). Returns a normalized
+  // shape with the current active model called out separately.
+  async function fetchProvidersSummary(_directory: string): Promise<{
+    providers: Array<{
+      id: string;
+      name: string;
+      models: Array<{
+        id: string;
+        name: string;
+        attachment: boolean;
+        reasoning: boolean;
+        limit?: { context?: number; output?: number };
+      }>;
+    }>;
+    current: { providerID: string; modelID: string } | null;
+  }> {
+    type APIModelInfo = {
+      id: string;
+      name: string;
+      providerID: string;
+      attachment: boolean;
+      reasoning: boolean;
+      limit: { context: number; output: number };
+    };
+    type ProvidersConfig = {
+      providers: Array<{ id: string; name: string; models: Record<string, APIModelInfo> }>;
+      default?: APIModelInfo | null;
+    };
+    type ProviderListShape = {
+      all: Array<{ id: string; name: string; models: Record<string, APIModelInfo> }>;
+      default: Record<string, string>;
+      connected: string[];
+    };
+
+    const [providers, providerList] = await Promise.all([
+      opencodeFetch(config, "GET", "/config/providers") as Promise<ProvidersConfig>,
+      opencodeFetch(config, "GET", "/provider") as Promise<ProviderListShape>,
+    ]);
+
+    const connected = new Set(providerList.connected);
+    const filtered = providers.providers.filter((p) => connected.has(p.id));
+
+    const shaped = filtered.map((p) => ({
+      id: p.id,
+      name: p.name,
+      models: Object.values(p.models)
+        .map((m) => ({
+          id: m.id,
+          name: m.name,
+          attachment: Boolean(m.attachment),
+          reasoning: Boolean(m.reasoning),
+          ...(m.limit ? { limit: { context: m.limit.context, output: m.limit.output } } : {}),
+        }))
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    }));
+
+    const current = providers.default
+      ? { providerID: providers.default.providerID, modelID: providers.default.id }
+      : null;
+
+    return { providers: shaped, current };
+  }
+
   // Cancel any pending question for the given peer. Idempotent — safe to call
   // when nothing is pending. Used by /reset and /session to avoid leaving a
   // stale prompt waiting for an answer after the conversation state changes.
@@ -2456,34 +2527,180 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
     const command = parts[0]?.toLowerCase();
     const args = parts.slice(1);
 
-    // Model switching commands
-    if (command && MODEL_PRESETS[command]) {
-      const model = MODEL_PRESETS[command];
-      setUserModel(channel, identityId, peerKey, model);
-      await sendText(channel, identityId, peerId, `Model switched to ${model.providerID}/${model.modelID}`, {
-        kind: "system",
-      });
-      logger.info({ channel, peerId: peerKey, model }, "model switched via command");
+    // /agent — list primary agents and switch active one.
+    // No arg: list with → marker on the active agent.
+    // With arg: id (or unique prefix) to switch via POST /agent/select.
+    if (command === "agent") {
+      const directory = resolveCommandDirectory(channel, identityId, peerKey);
+      const prefix = args.join(" ").trim();
+      try {
+        const agents = await fetchPrimaryAgents(directory);
+        if (!prefix) {
+          if (agents.length === 0) {
+            await sendText(channel, identityId, peerId, "No primary agents configured.", { kind: "system" });
+            return true;
+          }
+          const lines = agents.map((a) => {
+            const marker = a.active ? "→" : " ";
+            const model = a.model ? `  (${a.model})` : "";
+            return `${marker} ${a.id}${a.name && a.name !== a.id ? ` — ${a.name}` : ""}${model}`;
+          });
+          await sendText(
+            channel,
+            identityId,
+            peerId,
+            ["Primary agents:", ...lines, "Switch: /agent <id-prefix>"].join("\n"),
+            { kind: "system" },
+          );
+          return true;
+        }
+
+        const matches = agents.filter((a) => a.id.startsWith(prefix));
+        if (matches.length === 0) {
+          await sendText(channel, identityId, peerId, `No agent matches "${prefix}". Try /agent.`, { kind: "system" });
+          return true;
+        }
+        if (matches.length > 1) {
+          const lines = matches.slice(0, 5).map((a) => `  ${a.id}${a.name && a.name !== a.id ? ` — ${a.name}` : ""}`);
+          await sendText(
+            channel,
+            identityId,
+            peerId,
+            [`"${prefix}" matches ${matches.length} agents — be more specific:`, ...lines].join("\n"),
+            { kind: "system" },
+          );
+          return true;
+        }
+
+        const target = matches[0]!;
+        if (target.active) {
+          await sendText(channel, identityId, peerId, `Already active: ${target.id}`, { kind: "system" });
+          return true;
+        }
+
+        await opencodeFetch(config, "POST", "/agent/select", { id: target.id });
+        logger.info({ channel, peerId: peerKey, agentId: target.id }, "agent switched via command");
+        await sendText(
+          channel,
+          identityId,
+          peerId,
+          [
+            `Active agent: ${target.id}${target.name && target.name !== target.id ? ` (${target.name})` : ""}`,
+            "Affects every chat on this opencode process. Prompt cache invalidated — long sessions will re-read history on the next turn.",
+          ].join("\n"),
+          { kind: "system" },
+        );
+      } catch (error) {
+        logger.warn({ error }, "agent command failed");
+        const msg = error instanceof Error ? error.message : "Agent command failed.";
+        await sendText(channel, identityId, peerId, msg, { kind: "system" });
+      }
       return true;
     }
 
-    // /model command - show current model
+    // /model — list available providers + models (current marked), or switch.
+    // No arg: list, grouped by provider, filtered to connected providers.
+    // With arg: model ID (with optional provider/ prefix), POST /agent/model/select.
     if (command === "model") {
-      const current = getUserModel(channel, identityId, peerKey, config.model);
-      const modelStr = current ? `${current.providerID}/${current.modelID}` : "default";
-      await sendText(channel, identityId, peerId, `Current model: ${modelStr}`, { kind: "system" });
+      const directory = resolveCommandDirectory(channel, identityId, peerKey);
+      const arg = args.join(" ").trim();
+      try {
+        if (!arg) {
+          const summary = await fetchProvidersSummary(directory);
+          if (summary.providers.length === 0) {
+            await sendText(channel, identityId, peerId, "No connected providers. Configure provider API keys in opencode.", { kind: "system" });
+            return true;
+          }
+          const lines: string[] = [];
+          for (const p of summary.providers) {
+            lines.push(`[${p.name}]`);
+            for (const m of p.models) {
+              const isCurrent = summary.current?.providerID === p.id && summary.current?.modelID === m.id;
+              const marker = isCurrent ? "→" : " ";
+              const traits: string[] = [];
+              if (m.reasoning) traits.push("reasoning");
+              if (m.attachment) traits.push("attach");
+              if (m.limit?.context) traits.push(`ctx ${formatTokens(m.limit.context)}`);
+              if (m.limit?.output) traits.push(`out ${formatTokens(m.limit.output)}`);
+              const traitsStr = traits.length ? `  (${traits.join(", ")})` : "";
+              lines.push(`${marker} ${m.id}${traitsStr}`);
+            }
+          }
+          lines.push("Switch: /model <model-id>  (qualify with provider/model-id if the ID is ambiguous)");
+          await sendText(channel, identityId, peerId, lines.join("\n"), { kind: "system" });
+          return true;
+        }
+
+        // Switching path. Accept "model-id" or "provider/model-id".
+        const summary = await fetchProvidersSummary(directory);
+        let target: { providerID: string; modelID: string; modelName: string } | null = null;
+
+        const slash = arg.indexOf("/");
+        if (slash > 0) {
+          const providerID = arg.slice(0, slash);
+          const modelID = arg.slice(slash + 1);
+          const provider = summary.providers.find((p) => p.id === providerID);
+          const model = provider?.models.find((m) => m.id === modelID);
+          if (!model || !provider) {
+            await sendText(channel, identityId, peerId, `No model ${providerID}/${modelID} among connected providers. Try /model.`, { kind: "system" });
+            return true;
+          }
+          target = { providerID, modelID, modelName: model.name };
+        } else {
+          const candidates: Array<{ providerID: string; providerName: string; modelID: string; modelName: string }> = [];
+          for (const p of summary.providers) {
+            for (const m of p.models) {
+              if (m.id === arg) {
+                candidates.push({ providerID: p.id, providerName: p.name, modelID: m.id, modelName: m.name });
+              }
+            }
+          }
+          if (candidates.length === 0) {
+            await sendText(channel, identityId, peerId, `No model "${arg}" among connected providers. Try /model.`, { kind: "system" });
+            return true;
+          }
+          if (candidates.length > 1) {
+            const hints = candidates.map((c) => `  ${c.providerID}/${c.modelID}`);
+            await sendText(
+              channel,
+              identityId,
+              peerId,
+              [`"${arg}" exists in ${candidates.length} providers — qualify:`, ...hints].join("\n"),
+              { kind: "system" },
+            );
+            return true;
+          }
+          target = { providerID: candidates[0]!.providerID, modelID: candidates[0]!.modelID, modelName: candidates[0]!.modelName };
+        }
+
+        await opencodeFetch(config, "POST", "/agent/model/select", { providerID: target.providerID, modelID: target.modelID });
+        logger.info({ channel, peerId: peerKey, providerID: target.providerID, modelID: target.modelID }, "model switched via command");
+        await sendText(
+          channel,
+          identityId,
+          peerId,
+          [
+            `Active model: ${target.providerID}/${target.modelID}`,
+            "Applied to the active agent. Prompt cache invalidated — long sessions will re-read history on the next turn.",
+          ].join("\n"),
+          { kind: "system" },
+        );
+      } catch (error) {
+        logger.warn({ error }, "model command failed");
+        const msg = error instanceof Error ? error.message : "Model command failed.";
+        await sendText(channel, identityId, peerId, msg, { kind: "system" });
+      }
       return true;
     }
 
-    // /reset command - clear model override, session, and pending questions
+    // /reset command - clear session and pending questions
     if (command === "reset") {
-      setUserModel(channel, identityId, peerKey, undefined);
       store.deleteSession(channel, identityId, peerKey);
       cancelPendingQuestion(channel, identityId, peerKey);
-      await sendText(channel, identityId, peerId, "Session and model reset. Send a message to start fresh.", {
+      await sendText(channel, identityId, peerId, "Session reset. Send a message to start fresh.", {
         kind: "system",
       });
-      logger.info({ channel, peerId: peerKey }, "session and model reset");
+      logger.info({ channel, peerId: peerKey }, "session reset");
       return true;
     }
 
@@ -2647,7 +2864,7 @@ export async function startBridge(config: Config, logger: Logger, reporter?: Bri
 
     // /help command
     if (command === "help") {
-      const helpText = `/opus - Claude Opus 4.5\n/codex - GPT 5.2 Codex\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/model - show current\n/skip - skip a pending question from the agent\n/sessions - list recent sessions in this workspace\n/session <id-prefix> - switch to a previous session\n/reset - start fresh\n/help - this`;
+      const helpText = `/agent - list primary agents (current marked)\n/agent <id-prefix> - switch active agent\n/model - list available models grouped by connected provider (current marked)\n/model <model-id> - switch model on the active agent (qualify with provider/model-id if ambiguous)\n/pair <code> - pair this chat with a private Telegram bot\n/dir <path> - bind this chat to a workspace directory\n/dir - show current directory\n/sessions - list recent sessions in this workspace\n/session <id-prefix> - switch to a previous session\n/skip - skip a pending question from the agent\n/reset - start fresh\n/help - this`;
       await sendText(channel, identityId, peerId, helpText, { kind: "system" });
       return true;
     }
